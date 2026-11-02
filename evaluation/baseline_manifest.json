@@ -1,0 +1,18 @@
+{
+  "reference": "nanoalloc buddy baseline, commit f3aad1b4b884ad91a6f47eff6168c557fd78f206",
+  "description": "SHA-256 of every file under include/ and src/ of the frozen reference. evaluate.py compiles exactly these files for the baseline and refuses a --baseline tree that differs (unless --allow-unverified-baseline).",
+  "digest": "1b7846a7b6d93e64cd36f864b5f8cd1ecbbfd0fd220ed7db86a1e720ef901943",
+  "files": {
+    "include/nanoalloc/allocator.hpp": "959e662242899829f4ec613798b6160a5533209a6453dfbf63dacf48c82e125e",
+    "include/nanoalloc/config.hpp": "9c312b3d1328acdaa0e9eda9fd4c8d5c2d8ef40d7f42eeb3fdf92af77e3306d7",
+    "include/nanoalloc/memory_resource.hpp": "cc92089777726662872acf31773d2b252dc7a99b6c60c1868893a20a5d529283",
+    "include/nanoalloc/nanoalloc.hpp": "27788d0cf9103a623070c6ef4c4652f03a47183864353c9b32ba423cf8259b39",
+    "include/nanoalloc/pool.hpp": "13e126ddd2faa4bacc99ab914875af2ce6e6690f1d7125e23f7fcebfda814465",
+    "include/nanoalloc/version.hpp": "bc39fb9a91fbc01208a8bd2ec90b3bb806c39d6698582fb2fe10e0c2619195c3",
+    "src/buddy_engine.cpp": "724ce9ca3fa64e1b328783e2c912f8ea122058337f1081788ab28a88ccd2f20d",
+    "src/buddy_engine.hpp": "480d9a7efa289513cd5588d57ca76a82c99f4fc6e405fe5a17842f0fb9622597",
+    "src/diagnostics.cpp": "140dd4991c39f8333b957a787f3c6b7820b87d780d56d1b0b305f33e28cdc1fd",
+    "src/diagnostics.hpp": "8651c80c7e46625e733eec0c429485ab9ceb56fe92715f80d0f0f725b8aa9945",
+    "src/pool.cpp": "9ac9b37674bd7049bd4637922149f5f78d5bdb41224424ce436c39289b794835"
+  }
+}
