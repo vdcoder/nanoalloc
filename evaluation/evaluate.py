@@ -24,6 +24,8 @@ Steps:
 Score per workload: 100 * baseline median time / candidate median time, where
 the median time of an implementation is the median over its processes of each
 process's median iteration time. Overall: geometric mean of the nine scores.
+Interval: order-statistic confidence interval (>= 98%) of the median of the
+per-round overall scores, widened by the A/A bias for the verdict.
 
 Exit status: 0 PASS (or measured, when no --threshold is given), 1 FAIL,
 2 INCONCLUSIVE, 3 evaluation error (invalid input, baseline unusable, tools
@@ -383,6 +385,27 @@ def implementation_summary(runs):
     return summary
 
 
+INTERVAL_COVERAGE = 0.98
+
+
+def median_interval(values, coverage=INTERVAL_COVERAGE):
+    """Distribution-free confidence interval for the median of the population
+    `values` was drawn from: [x(k), x(n+1-k)] of the sorted values, with the
+    largest k whose coverage 1 - 2 * P(Binomial(n, 1/2) <= k - 1) is at least
+    `coverage` (k = 1, the full range, if none reaches it). Returns
+    (low, high, coverage, k)."""
+    n = len(values)
+    ordered = sorted(values)
+
+    def covers(k):
+        return 1.0 - 2.0 * sum(math.comb(n, i) for i in range(k)) / 2.0 ** n
+
+    k = 1
+    while k + 1 <= (n + 1) // 2 and covers(k + 1) >= coverage:
+        k += 1
+    return ordered[k - 1], ordered[n - k], covers(k), k
+
+
 def compare(reference_runs, other_runs):
     """Scores of `other` relative to `reference` (100 = equal speed)."""
     reference = implementation_summary(reference_runs)
@@ -405,17 +428,20 @@ def compare(reference_runs, other_runs):
     round_overall = [geometric_mean([workloads[w]["round_scores"][r] for w in WORKLOADS])
                      for r in range(rounds)]
     overall = geometric_mean([workloads[w]["speed_percent"] for w in WORKLOADS])
+    low, high, coverage, rank = median_interval(round_overall)
     return {
         "workloads": workloads,
         "overall_percent": overall,
         "round_overall": round_overall,
         "median_round_percent": statistics.median(round_overall),
-        # [min, max] of the per-round scores: the probability that the median
-        # round lies outside it is 2 * 0.5^n for n independent rounds. It is
-        # extended to include the overall score (a ratio of medians, which can
-        # fall just outside the paired rounds).
-        "interval": [min(min(round_overall), overall), max(max(round_overall), overall)],
-        "interval_confidence": 1.0 - 2.0 * 0.5 ** rounds,
+        "round_range": [min(round_overall), max(round_overall)],
+        # Confidence interval of the median round score from the order
+        # statistics of the rounds (with 11 rounds: the 2nd lowest to the 2nd
+        # highest, 98.8%). It is extended to include the overall score (a
+        # ratio of medians, which can fall just outside the paired rounds).
+        "interval": [min(low, overall), max(high, overall)],
+        "interval_confidence": coverage,
+        "interval_ranks": [rank, rounds + 1 - rank],
     }
 
 
@@ -510,10 +536,10 @@ def write_reports(out, results):
     lines += [f"**Verdict: {verdict['result']}** - {verdict['reason']}", ""]
     if main:
         lines += [f"Overall performance: **{main['overall_percent']:.1f}%** of the buddy baseline "
-                  f"(per-round range {main['interval'][0]:.1f}-{main['interval'][1]:.1f}%, "
-                  f"{100 * main['interval_confidence']:.1f}% confidence interval of the median "
-                  "round).", ""]
-        lines += ["| Workload | Buddy time | Candidate time | Performance % | Round range % | "
+                  f"({100 * main['interval_confidence']:.1f}% confidence interval of the median "
+                  f"round {main['interval'][0]:.1f}-{main['interval'][1]:.1f}%; round scores "
+                  f"{main['round_range'][0]:.1f}-{main['round_range'][1]:.1f}%).", ""]
+        lines += ["| Workload | Buddy time | Candidate time | Performance % | Rounds % | "
                   "Buddy spread % | Candidate spread % | A/A % |",
                   "|---|---:|---:|---:|---:|---:|---:|---:|"]
         for workload in WORKLOADS:
@@ -536,8 +562,9 @@ def write_reports(out, results):
                   "copy of itself, measured the same way.", ""]
     if aa:
         lines += ["## A/A calibration", "",
-                  f"Overall {aa['overall_percent']:.2f}% (per-round range "
-                  f"{aa['interval'][0]:.2f}-{aa['interval'][1]:.2f}%); bias "
+                  f"Overall {aa['overall_percent']:.2f}% (interval "
+                  f"{aa['interval'][0]:.2f}-{aa['interval'][1]:.2f}%, round scores "
+                  f"{aa['round_range'][0]:.2f}-{aa['round_range'][1]:.2f}%); bias "
                   f"{results['reliability']['aa_bias_pct']:.2f} points, limit "
                   f"{results['reliability']['max_aa_bias_pct']:.2f}; reliable: "
                   f"{results['reliability']['reliable']}.", ""]
@@ -630,7 +657,7 @@ def print_table(results):
             print(f"{workload:<14} {format_ms(item['reference_median_ns']):>14} "
                   f"{format_ms(item['other_median_ns']):>15} {item['speed_percent']:>14.1f}")
         print(f"{'OVERALL':<14} {'':>14} {'':>15} {main['overall_percent']:>14.1f}")
-        print(f"  per-round range {main['interval'][0]:.1f}-{main['interval'][1]:.1f}%; "
+        print(f"  interval {main['interval'][0]:.1f}-{main['interval'][1]:.1f}%; "
               f"A/A {results['calibration']['overall_percent']:.1f}%")
     verdict = results["verdict"]
     print(f"\nVERDICT: {verdict['result']} - {verdict['reason']}")
@@ -653,7 +680,7 @@ def parse_args(argv):
                         help="output directory (reports, logs, work files)")
     parser.add_argument("--threshold", type=float, default=None,
                         help="minimum overall performance percentage for PASS (optional)")
-    parser.add_argument("--processes", type=int, default=7,
+    parser.add_argument("--processes", type=int, default=11,
                         help="rounds: timing processes per implementation and workload, for "
                              "the A/A calibration and for the measurement (>= 3)")
     parser.add_argument("--iterations", type=int, default=9,
@@ -671,7 +698,7 @@ def parse_args(argv):
     parser.add_argument("--max-aa-bias", type=float, default=3.0,
                         help="largest acceptable A/A deviation from 100%% (percentage points)")
     parser.add_argument("--max-aa-range", type=float, default=30.0,
-                        help="largest acceptable width of the A/A per-round range (points)")
+                        help="largest acceptable width of the A/A interval (points)")
     parser.add_argument("--cxx", default=os.environ.get("CXX", "c++"), help="C++ compiler")
     parser.add_argument("--cmake", default="cmake", help="CMake executable")
     parser.add_argument("--generator", default="Ninja" if shutil.which("ninja") else "Unix Makefiles",
@@ -832,7 +859,7 @@ def evaluate(args):
         if failure:
             raise EvaluationError(f"baseline timing process failed: {failure}")
         calibration = compare(aa_base, aa_copy)
-        log(f"  A/A overall {calibration['overall_percent']:.2f}% (rounds "
+        log(f"  A/A overall {calibration['overall_percent']:.2f}% (interval "
             f"{calibration['interval'][0]:.2f}-{calibration['interval'][1]:.2f}%)")
         log(f"measurement: baseline against candidate, {args.processes} processes each")
         base_runs, cand_runs, failure = timing_rounds(implementations["baseline"], candidate,
@@ -847,7 +874,7 @@ def evaluate(args):
             failures.append("workload checksums differ between the drivers")
         else:
             measurement = compare(base_runs, cand_runs)
-            log(f"  overall {measurement['overall_percent']:.2f}% (rounds "
+            log(f"  overall {measurement['overall_percent']:.2f}% (interval "
                 f"{measurement['interval'][0]:.2f}-{measurement['interval'][1]:.2f}%)")
             results["capacities"] = {
                 "baseline": {w: base_runs[w][0]["capacity"] for w in WORKLOADS},
@@ -912,7 +939,7 @@ def evaluate(args):
         if reliability["aa_bias_pct"] > args.max_aa_bias:
             problems.append(f"bias {reliability['aa_bias_pct']:.2f} > {args.max_aa_bias} points")
         if reliability["aa_range_pct"] > args.max_aa_range:
-            problems.append(f"per-round range {reliability['aa_range_pct']:.2f} > "
+            problems.append(f"interval width {reliability['aa_range_pct']:.2f} > "
                             f"{args.max_aa_range} points")
         verdict = {"result": "INCONCLUSIVE",
                    "reason": "measurement noise too high: A/A calibration " + ", ".join(problems)}

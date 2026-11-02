@@ -99,7 +99,7 @@ File names and internal structure are free; nothing has to be renamed.
    completes each workload, found by bisection (untimed).
 7. **Scores, verdict, reports.**
 
-Defaults: 7 rounds, 2 warmup and 9 measured replays per process, scale 1.0
+Defaults: 11 rounds, 2 warmup and 9 measured replays per process, scale 1.0
 (the original operation counts). The minimums are 3 rounds, 1 warmup and 7
 measured replays. Other scales are flagged as non-standard in the report.
 
@@ -116,13 +116,17 @@ overall       = geometric mean of the nine speed_percent values
 100% is equal throughput; above 100% the candidate is faster.
 
 **Uncertainty.** Each round's paired processes give one overall score (the
-geometric mean of the nine per-workload ratios of that round). With *n*
-rounds, the range [min, max] of these round scores contains the median round
-score with probability 1 - 2 * 0.5^n (98.4% for 7 rounds). The range is
-extended to include the overall score if needed.
+geometric mean of the nine per-workload ratios of that round). The interval is
+a distribution-free confidence interval for the median round score, taken from
+the sorted round scores: from the *k*-th lowest to the *k*-th highest, with
+the largest *k* whose confidence 1 - 2 * P(Binomial(n, 1/2) <= k - 1) is at
+least 98%. With the default 11 rounds that is the 2nd lowest to the 2nd
+highest (98.8%), so a single disturbed round does not decide the verdict;
+with 7 rounds it is the full range (98.4%). The interval is extended to include
+the overall score if needed.
 
 **Reliability.** The A/A calibration must score within `--max-aa-bias` of 100%
-(default 3 points). The range of its round scores must not exceed
+(default 3 points). The width of its interval must not exceed
 `--max-aa-range` (default 30 points), a guard against pathological noise;
 ordinary noise is handled by the decision interval. Otherwise the measurement
 is not considered reliable.
@@ -137,8 +141,8 @@ is not considered reliable.
 | FAIL | the upper end of the decision interval is below T |
 | INCONCLUSIVE | otherwise (T lies inside the decision interval) |
 
-The decision interval is the round range widened by the A/A bias on both
-sides. The threshold is only ever taken from `--threshold`.
+The decision interval is the measurement's interval widened by the A/A bias
+on both sides. The threshold is only ever taken from `--threshold`.
 
 Without `--threshold`, the verdict is MEASURED (or FAIL for a correctness
 failure).
@@ -155,7 +159,7 @@ Written to `--out` (default `./nanoeval-results`):
 
 | File | Contents |
 | --- | --- |
-| `report.md` | Verdict; table of buddy time, candidate time, performance %, round range, spreads and A/A % per workload and overall; A/A calibration; correctness gate with every conformance check; actual consumption; memory footprint and capacities; environment |
+| `report.md` | Verdict; table of buddy time, candidate time, performance %, range of the round scores, spreads and A/A % per workload and overall; A/A calibration; correctness gate with every conformance check; actual consumption; memory footprint and capacities; environment |
 | `results.json` | Everything in the report plus all raw per-process iteration times, self-reported statistics and build details |
 | `results.csv` | One row per workload and comparison (calibration, measurement) |
 | `evaluation.log`, `logs/` | Progress, build logs, driver and test output |
