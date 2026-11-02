@@ -30,6 +30,14 @@ extern "C" void __asan_unpoison_memory_region(void const volatile* addr, std::si
 #endif
 #endif
 
+// Keeps rarely used paths out of line so that the hot paths that branch to
+// them need no saved registers or stack frame.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define NANOALLOC_NOINLINE __declspec(noinline)
+#else
+#define NANOALLOC_NOINLINE __attribute__((noinline))
+#endif
+
 namespace nanoalloc::detail {
 
 /// Prints "nanoalloc: fatal error: <message> (pointer <ptr>)" to stderr and

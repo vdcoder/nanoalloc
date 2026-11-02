@@ -361,7 +361,7 @@ NANO_TEST(multilevel_coalescing_restores_the_span) {
     }
     CHECK_EQ(heap->free_block_count(bucket_index(kFreshBlock)), 1U);
     CHECK_EQ(heap->counters().fragment_bytes.get(), 0U);
-    CHECK_EQ(heap->counters().live_count.get(), 0U);
+    CHECK_EQ(heap->counters().live_count(), 0U);
     REQUIRE_HEAP_VALID(*heap);
 }
 
@@ -728,7 +728,7 @@ NANO_TEST(randomized_fragmentation_keeps_structures_consistent) {
         heap_free(*heap, entry.ptr);
     }
     REQUIRE_HEAP_VALID(*heap);
-    CHECK_EQ(heap->counters().live_count.get(), 0U);
+    CHECK_EQ(heap->counters().live_count(), 0U);
     CHECK_EQ(heap->counters().fragment_bytes.get(), 0U);
 }
 

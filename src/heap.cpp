@@ -6,6 +6,47 @@
 
 namespace nanoalloc::detail {
 
+void* ThreadHeap::allocate_split(std::size_t requested, std::size_t payload) noexcept {
+    drain_pending();
+    const std::size_t need = payload + kHeaderSize;
+    Fit fit = find_fit(need);
+    if (fit.block == nullptr) [[unlikely]] {
+        if (!grow(need)) {
+            counters_.failed.add(1);
+            return nullptr;
+        }
+        fit = find_fit(need);
+    }
+    // Carve the allocation from the end of the free block, so the remaining
+    // free block keeps its header (and often its bucket).
+    Block* free_block = fit.block;
+    const std::uint64_t free_word1 = load_word(free_block->word1);
+    const std::size_t size = size_field(free_word1);
+    const std::size_t rest = size - need;
+    if (rest == 0) {
+        unlink_free(free_block, fit.bucket);
+        return finish(free_block, need, prev_field(free_word1), requested, payload);
+    }
+    if (rest >= kMinFreeBlock) {
+        // A remainder that stays within the bucket's bounds keeps its place.
+        if (rest < kBucketBounds.min[fit.bucket]) {
+            unlink_free(free_block, fit.bucket);
+            push_free(free_block, bucket_index(rest));
+        }
+    } else {
+        // A 16-byte remainder cannot hold list links. It stays a header-only
+        // FREE block and is merged when a neighbour is released.
+        unlink_free(free_block, fit.bucket);
+        counters_.fragment_bytes.add(kHeaderSize);
+    }
+    store_word(free_block->word1, (free_word1 & ~kSizeMask) | rest);
+    Block* block = block_after(free_block, rest);
+    unpoison_memory(block, kHeaderSize);
+    set_following_prev(block, need);
+    counters_.splits.add(1);
+    return finish(block, need, rest, requested, payload);
+}
+
 void* ThreadHeap::allocate_aligned(std::size_t requested, std::size_t payload,
                                    std::size_t alignment) noexcept {
     drain_pending();
@@ -175,6 +216,7 @@ const char* ThreadHeap::validate() const noexcept {
     std::size_t free_listable = 0;
     std::size_t total_blocks = 0;
     std::uint64_t live_count = 0;
+    std::uint64_t live_consumed = 0;
     std::uint64_t live_payload = 0;
     std::uint64_t live_requested = 0;
     std::uint64_t fragments = 0;
@@ -223,6 +265,7 @@ const char* ThreadHeap::validate() const noexcept {
                 }
                 const std::size_t payload = size - kHeaderSize;
                 ++live_count;
+                live_consumed += size;
                 live_payload += payload;
                 live_requested += payload - (word1 & kSlackMask);
             } else {
@@ -290,7 +333,8 @@ const char* ThreadHeap::validate() const noexcept {
         return "free lists do not contain exactly the free blocks";
     }
     const HeapCounters& c = counters_;
-    if (c.live_count.get() != live_count || c.live_payload.get() != live_payload ||
+    if (c.live_count() != live_count || c.live_consumed.get() != live_consumed ||
+        c.live_payload.get() != live_payload ||
         c.live_requested.get() != live_requested) {
         return "live-allocation counters disagree with the blocks";
     }

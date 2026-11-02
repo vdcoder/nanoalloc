@@ -92,6 +92,22 @@ static_assert(kBitmapWords <= 64, "the summary word has one bit per bitmap word"
                                      : std::size_t{1} << 20;
 }
 
+/// Bucket bounds as tables, so hot paths can test "does this size stay in
+/// its bucket" with one load instead of recomputing the bucket index.
+struct BucketBounds {
+    std::uint32_t min[kBucketCount];
+    std::uint32_t max[kBucketCount];
+};
+
+inline constexpr BucketBounds kBucketBounds = [] {
+    BucketBounds bounds{};
+    for (unsigned bucket = 0; bucket < kBucketCount; ++bucket) {
+        bounds.min[bucket] = static_cast<std::uint32_t>(bucket_min_size(bucket));
+        bounds.max[bucket] = static_cast<std::uint32_t>(bucket_max_size(bucket));
+    }
+    return bounds;
+}();
+
 // ---- header encoding ----------------------------------------------------------
 inline constexpr std::uint64_t kStateMask = 3;
 inline constexpr std::uint64_t kStateExternal = 0;

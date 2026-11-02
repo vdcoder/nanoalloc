@@ -85,24 +85,36 @@ private:
     std::atomic<std::uint64_t> value_{0};
 };
 
-/// Statistics of one heap. Written only by the owning thread.
+/// Statistics of one heap. Written only by the owning thread. The live
+/// allocation count and the allocation count are derived rather than stored,
+/// which keeps the allocation path to three counter updates.
 struct HeapCounters {
-    OwnerCounter allocations;          // successful in-span allocations
     OwnerCounter local_frees;          // deallocations of own blocks
     OwnerCounter remote_frees_sent;    // deallocations of other threads' blocks
     OwnerCounter remote_frees_drained; // own blocks released through the inbox
     OwnerCounter failed;               // failed allocations
     OwnerCounter splits;
     OwnerCounter merges;
-    OwnerCounter live_count;           // allocated blocks, including pending
-    OwnerCounter live_payload;         // sum of payload sizes of live blocks
-    OwnerCounter live_requested;       // sum of requested sizes of live blocks
+    OwnerCounter live_consumed;        // header + payload bytes of live blocks
+    OwnerCounter live_payload;         // payload bytes of live blocks
+    OwnerCounter live_requested;       // requested bytes of live blocks
+    OwnerCounter peak_consumed;
     OwnerCounter peak_payload;
     OwnerCounter peak_requested;
-    OwnerCounter peak_consumed;        // payload + header bytes
     OwnerCounter fragment_bytes;       // free 16-byte (header-only) blocks
     OwnerCounter span_count;
     OwnerCounter span_bytes;
+
+    /// Allocated blocks, including blocks pending in the inbox.
+    [[nodiscard]] std::uint64_t live_count() const noexcept {
+        const std::uint64_t consumed = live_consumed.get();
+        const std::uint64_t payload = live_payload.get();
+        return consumed > payload ? (consumed - payload) / kHeaderSize : 0;
+    }
+    /// Successful in-span allocations since the heap was created.
+    [[nodiscard]] std::uint64_t allocations() const noexcept {
+        return live_count() + local_frees.get() + remote_frees_drained.get();
+    }
 };
 
 class alignas(64) ThreadHeap {
@@ -128,11 +140,20 @@ public:
     /// Releases an ALLOCATED block owned by this heap (`word1` is its header).
     void deallocate_local(Block* block, std::uint64_t word1) noexcept {
         if (inbox_.load(std::memory_order_relaxed) != 0) [[unlikely]] {
-            drain_inbox();
-            // Draining may have merged a neighbour and rewritten this block's
-            // previous-size field.
-            word1 = load_word(block->word1);
+            deallocate_local_after_drain(block);
+            return;
         }
+        account_release(word1);
+        counters_.local_frees.add(1);
+        release(block, word1);
+    }
+
+    /// As deallocate_local(), when the inbox has to be drained first.
+    NANOALLOC_NOINLINE void deallocate_local_after_drain(Block* block) noexcept {
+        drain_inbox();
+        // Draining may have merged a neighbour and rewritten this block's
+        // previous-size field, so the header is read again.
+        const std::uint64_t word1 = load_word(block->word1);
         account_release(word1);
         counters_.local_frees.add(1);
         release(block, word1);
@@ -222,14 +243,16 @@ private:
 
     void* finish(Block* block, std::size_t need, std::size_t prev, std::size_t requested,
                  std::size_t payload) noexcept;
+    /// Allocation path that has to search the bitmap and split a block.
+    void* allocate_split(std::size_t requested, std::size_t payload) noexcept;
     bool grow(std::size_t need) noexcept;
     void add_span(Span* span) noexcept;
     void release(Block* block, std::uint64_t word1) noexcept;
     void account_release(std::uint64_t word1) noexcept {
-        const std::size_t payload = size_field(word1) - kHeaderSize;
-        counters_.live_count.sub(1);
-        counters_.live_payload.sub(payload);
-        counters_.live_requested.sub(payload - (word1 & kSlackMask));
+        const std::size_t size = size_field(word1);
+        counters_.live_consumed.sub(size);
+        counters_.live_payload.sub(size - kHeaderSize);
+        counters_.live_requested.sub(size - kHeaderSize - (word1 & kSlackMask));
     }
     void drain_inbox() noexcept;
 
@@ -305,7 +328,10 @@ inline ThreadHeap::Fit ThreadHeap::find_fit(std::size_t need) const noexcept {
     const unsigned bucket = bucket_index(need);
     if (need <= kExactLimit) [[likely]] {
         // Exact buckets hold one size each, so every block found from here on
-        // is large enough.
+        // is large enough. An exact fit needs no bitmap search.
+        if (Block* exact = heads_[bucket]; exact != nullptr) {
+            return {exact, bucket};
+        }
         const unsigned found = find_nonempty(bucket);
         if (found < kBucketCount) {
             return {heads_[found], found};
@@ -336,65 +362,41 @@ inline void* ThreadHeap::finish(Block* block, std::size_t need, std::size_t prev
     store_word(block->word1, make_word1(need, prev, payload - requested));
     store_word(block->word0, owner_word() | kStateAllocated);
     unpoison_memory(payload_of(block), payload);
+    // Each counter is read once and written once.
     HeapCounters& c = counters_;
-    c.allocations.add(1);
-    c.live_count.add(1);
-    c.live_payload.add(payload);
-    c.live_requested.add(requested);
-    const std::uint64_t live_payload = c.live_payload.get();
+    const std::uint64_t consumed = c.live_consumed.get() + need;
+    const std::uint64_t live_payload = c.live_payload.get() + payload;
+    const std::uint64_t live_requested = c.live_requested.get() + requested;
+    c.live_consumed.set(consumed);
+    c.live_payload.set(live_payload);
+    c.live_requested.set(live_requested);
+    if (consumed > c.peak_consumed.get()) {
+        c.peak_consumed.set(consumed);
+    }
     if (live_payload > c.peak_payload.get()) {
         c.peak_payload.set(live_payload);
     }
-    const std::uint64_t live_requested = c.live_requested.get();
     if (live_requested > c.peak_requested.get()) {
         c.peak_requested.set(live_requested);
-    }
-    const std::uint64_t consumed = live_payload + c.live_count.get() * kHeaderSize;
-    if (consumed > c.peak_consumed.get()) {
-        c.peak_consumed.set(consumed);
     }
     return payload_of(block);
 }
 
 inline void* ThreadHeap::allocate(std::size_t requested, std::size_t payload) noexcept {
-    drain_pending();
     const std::size_t need = payload + kHeaderSize;
-    Fit fit = find_fit(need);
-    if (fit.block == nullptr) [[unlikely]] {
-        if (!grow(need)) {
-            counters_.failed.add(1);
-            return nullptr;
+    // Fast path: an empty inbox and a free block of exactly the needed size.
+    if (need <= kExactLimit && inbox_.load(std::memory_order_relaxed) == 0) [[likely]] {
+        const unsigned bucket = static_cast<unsigned>(need >> 4) - 1;
+        if (Block* block = heads_[bucket]; block != nullptr) {
+            Block* next = link_next(block);
+            heads_[bucket] = next;
+            if (next == nullptr) {
+                mark_empty(bucket);
+            }
+            return finish(block, need, prev_field(load_word(block->word1)), requested, payload);
         }
-        fit = find_fit(need);
     }
-    // Carve the allocation from the end of the free block, so the remaining
-    // free block keeps its header (and often its bucket).
-    Block* free_block = fit.block;
-    const std::uint64_t free_word1 = load_word(free_block->word1);
-    const std::size_t size = size_field(free_word1);
-    const std::size_t rest = size - need;
-    if (rest == 0) {
-        unlink_free(free_block, fit.bucket);
-        return finish(free_block, need, prev_field(free_word1), requested, payload);
-    }
-    if (rest >= kMinFreeBlock) {
-        const unsigned rest_bucket = bucket_index(rest);
-        if (rest_bucket != fit.bucket) {
-            unlink_free(free_block, fit.bucket);
-            push_free(free_block, rest_bucket);
-        }
-    } else {
-        // A 16-byte remainder cannot hold list links. It stays a header-only
-        // FREE block and is merged when a neighbour is released.
-        unlink_free(free_block, fit.bucket);
-        counters_.fragment_bytes.add(kHeaderSize);
-    }
-    store_word(free_block->word1, (free_word1 & ~kSizeMask) | rest);
-    Block* block = block_after(free_block, rest);
-    unpoison_memory(block, kHeaderSize);
-    set_following_prev(block, need);
-    counters_.splits.add(1);
-    return finish(block, need, rest, requested, payload);
+    return allocate_split(requested, payload);
 }
 
 inline void ThreadHeap::release(Block* block, std::uint64_t word1) noexcept {
@@ -428,7 +430,7 @@ inline void ThreadHeap::release(Block* block, std::uint64_t word1) noexcept {
             store_word(block->word0, owner_word() | kStateFree);
             if (prev_size >= kMinFreeBlock) {
                 const unsigned prev_bucket = bucket_index(prev_size);
-                if (bucket_index(merged) == prev_bucket) {
+                if (merged <= kBucketBounds.max[prev_bucket]) {
                     // Grows within its bucket: update in place, no list work.
                     store_word(prev->word1, (prev_word1 & ~kSizeMask) | merged);
                     set_following_prev(prev, merged);

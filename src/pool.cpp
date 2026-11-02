@@ -119,6 +119,16 @@ public:
     PoolCore& operator=(const PoolCore&) = delete;
 
     void* allocate(std::size_t bytes, std::size_t alignment) noexcept {
+        if (alignment == detail::kGranule && bytes <= detail::kMaxSpanPayload) [[likely]] {
+            const TlsSlot& slot = t_state.slots[id_ & (kTlsSlots - 1)];
+            if (slot.pool_id == id_ && slot.heap != nullptr) [[likely]] {
+                return slot.heap->allocate(bytes, round_up(bytes, detail::kGranule));
+            }
+        }
+        return allocate_general(bytes, alignment);
+    }
+
+    NANOALLOC_NOINLINE void* allocate_general(std::size_t bytes, std::size_t alignment) noexcept {
         if (!is_supported_alignment(alignment)) [[unlikely]] {
             failed_.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
@@ -141,17 +151,38 @@ public:
     }
 
     void deallocate(void* ptr) noexcept {
+        // Fast path: an aligned, valid, allocated block owned by the calling
+        // thread whose heap is in the thread-local cache. Everything else is
+        // handled out of line.
+        if ((detail::address_of(ptr) & (detail::kGranule - 1)) == 0) [[likely]] {
+            Block* block = detail::header_of(ptr);
+            const std::uint64_t word0 = detail::load_word(block->word0);
+            const std::uint64_t word1 = detail::load_word(block->word1);
+            const TlsSlot& slot = t_state.slots[id_ & (kTlsSlots - 1)];
+            if ((word0 & detail::kStateMask) == detail::kStateAllocated &&
+                (word1 & detail::kMagicMask) == detail::kMagic && slot.pool_id == id_ &&
+                (word0 & detail::kOwnerMask) == detail::address_of(slot.heap)) [[likely]] {
+                slot.heap->deallocate_local(block, word1);
+                return;
+            }
+        }
+        deallocate_slow(ptr);
+    }
+
+    /// Every deallocation that is not a plain local free, including the
+    /// diagnosis of invalid pointers.
+    NANOALLOC_NOINLINE void deallocate_slow(void* ptr) noexcept {
         Block* block = checked_header(ptr);
         const std::uint64_t word0 = detail::load_word(block->word0);
         const std::uint64_t state = word0 & detail::kStateMask;
-        if (state == detail::kStateAllocated) [[likely]] {
+        if (state == detail::kStateAllocated) {
             const std::uint64_t word1 = detail::load_word(block->word1);
-            if ((word1 & detail::kMagicMask) != detail::kMagic) [[unlikely]] {
+            if ((word1 & detail::kMagicMask) != detail::kMagic) {
                 bad_pointer(ptr);
             }
             auto* owner = reinterpret_cast<ThreadHeap*>(word0 & detail::kOwnerMask);
             ThreadHeap* self = current_heap(false);
-            if (owner == self) [[likely]] {
+            if (owner == self) {
                 self->deallocate_local(block, word1);
                 return;
             }
@@ -602,6 +633,7 @@ PoolStats PoolCore::stats() const noexcept {
 
     std::lock_guard<std::mutex> lock(mutex_);
     std::uint64_t live_count = 0;
+    std::uint64_t live_consumed = 0;
     std::uint64_t live_payload = 0;
     std::uint64_t live_requested = 0;
     std::uint64_t allocations = 0;
@@ -614,10 +646,11 @@ PoolStats PoolCore::stats() const noexcept {
     std::uint64_t peak_consumed = 0;
     for (const ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
         const detail::HeapCounters& c = heap->counters();
-        live_count += c.live_count.get();
+        live_count += c.live_count();
+        live_consumed += c.live_consumed.get();
         live_payload += c.live_payload.get();
         live_requested += c.live_requested.get();
-        allocations += c.allocations.get();
+        allocations += c.allocations();
         local_frees += c.local_frees.get();
         remote_sent += c.remote_frees_sent.get();
         remote_drained += c.remote_frees_drained.get();
@@ -639,7 +672,7 @@ PoolStats PoolCore::stats() const noexcept {
 
     stats.live_allocations = live_count + external_live_;
     stats.live_usable_bytes = live_payload + external_payload_;
-    stats.live_consumed_bytes = live_payload + live_count * kHeaderSize + external_reserved_;
+    stats.live_consumed_bytes = live_consumed + external_reserved_;
     stats.header_bytes = live_count * kHeaderSize + (external_reserved_ - external_payload_);
     stats.pending_remote_frees = remote_sent > remote_drained ? remote_sent - remote_drained : 0;
     stats.oversized_live_allocations = external_live_;

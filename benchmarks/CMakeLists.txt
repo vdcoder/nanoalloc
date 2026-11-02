@@ -9,6 +9,15 @@ add_executable(nanoalloc_bench
 target_link_libraries(nanoalloc_bench PRIVATE nanoalloc::nanoalloc)
 nanoalloc_apply_warnings(nanoalloc_bench)
 
+add_executable(nanoalloc_mtbench
+    mt_benchmark.cpp
+    platform.cpp
+    platform.hpp
+    workloads.cpp
+    workloads.hpp)
+target_link_libraries(nanoalloc_mtbench PRIVATE nanoalloc::nanoalloc Threads::Threads)
+nanoalloc_apply_warnings(nanoalloc_mtbench)
+
 # Record how the benchmark was built so that reports can state it.
 # Flags are embedded verbatim in raw string literals, so quotes, backslashes
 # and other characters in them need no escaping. Only the configuration name
@@ -27,13 +36,18 @@ file(CONFIGURE OUTPUT ${_nanobench_generated}/nanobench_build_flags.hpp @ONLY CO
 file(GENERATE
     OUTPUT ${_nanobench_generated}/$<CONFIG>/nanobench_build_type.hpp
     CONTENT "#pragma once\n#define NANOBENCH_BUILD_TYPE \"$<CONFIG>\"\n")
-target_include_directories(nanoalloc_bench PRIVATE
-    ${_nanobench_generated}
-    ${_nanobench_generated}/$<CONFIG>)
+foreach(_target nanoalloc_bench nanoalloc_mtbench)
+    target_include_directories(${_target} PRIVATE
+        ${_nanobench_generated}
+        ${_nanobench_generated}/$<CONFIG>)
+endforeach()
 
 # A short smoke run so CI verifies that the benchmark builds and executes.
 if(BUILD_TESTING)
     add_test(NAME benchmark.smoke
         COMMAND nanoalloc_bench --scale 0.02 --iterations 1 --warmup 0)
     set_tests_properties(benchmark.smoke PROPERTIES LABELS "benchmark" TIMEOUT 600)
+    add_test(NAME benchmark.mt_smoke
+        COMMAND nanoalloc_mtbench --threads 1,2 --remote 0,50 --objects 2000 --rounds 1)
+    set_tests_properties(benchmark.mt_smoke PROPERTIES LABELS "benchmark" TIMEOUT 600)
 endif()
