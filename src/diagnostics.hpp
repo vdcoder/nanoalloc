@@ -45,6 +45,14 @@ namespace nanoalloc::detail {
 /// (deallocate() is noexcept) and must not be allowed to corrupt the pool.
 [[noreturn]] void fatal_error(const char* message, const void* ptr) noexcept;
 
+/// What an allocation path does when it cannot satisfy a request. kThrow
+/// lets the throwing API raise std::bad_alloc from the out-of-line paths, so
+/// that its inline fast path never has to test the result.
+enum class OnFailure { kReturnNull, kThrow };
+
+/// Throws std::bad_alloc.
+[[noreturn]] void throw_bad_alloc();
+
 // When AddressSanitizer is active, memory inside the arena that is not part of
 // a live allocation is poisoned, so use-after-free and overflows into free
 // blocks are reported by ASan even though the arena is a single system

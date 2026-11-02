@@ -6,13 +6,18 @@
 
 namespace nanoalloc::detail {
 
-void* ThreadHeap::allocate_split(std::size_t requested, std::size_t payload) noexcept {
+template <OnFailure Policy>
+void* ThreadHeap::allocate_split(std::size_t requested,
+                                 std::size_t payload) noexcept(Policy == OnFailure::kReturnNull) {
     drain_pending();
     const std::size_t need = payload + kHeaderSize;
     Fit fit = find_fit(need);
     if (fit.block == nullptr) [[unlikely]] {
         if (!grow(need)) {
             counters_.failed.add(1);
+            if constexpr (Policy == OnFailure::kThrow) {
+                throw_bad_alloc();
+            }
             return nullptr;
         }
         fit = find_fit(need);
@@ -47,8 +52,13 @@ void* ThreadHeap::allocate_split(std::size_t requested, std::size_t payload) noe
     return finish(block, need, rest, requested, payload);
 }
 
+template void* ThreadHeap::allocate_split<OnFailure::kReturnNull>(std::size_t,
+                                                                  std::size_t) noexcept;
+template void* ThreadHeap::allocate_split<OnFailure::kThrow>(std::size_t, std::size_t);
+
+template <OnFailure Policy>
 void* ThreadHeap::allocate_larger(std::size_t requested, std::size_t payload,
-                                  unsigned bucket) noexcept {
+                                  unsigned bucket) noexcept(Policy == OnFailure::kReturnNull) {
     // The same block allocate_split() would choose (the exact bucket is empty,
     // so the best fit is the head of the next non-empty bucket), without its
     // general cases: every block from bucket + 1 on is larger than `need`, so
@@ -56,7 +66,7 @@ void* ThreadHeap::allocate_larger(std::size_t requested, std::size_t payload,
     // head of its list.
     const unsigned found = find_nonempty(bucket + 1);
     if (found == kBucketCount) [[unlikely]] {
-        return allocate_split(requested, payload);  // acquires a span
+        return allocate_split<Policy>(requested, payload);  // acquires a span
     }
     const std::size_t need = payload + kHeaderSize;
     Block* free_block = heads_[found];
@@ -83,6 +93,11 @@ void* ThreadHeap::allocate_larger(std::size_t requested, std::size_t payload,
     counters_.splits.add(1);
     return finish(block, need, rest, requested, payload);
 }
+
+template void* ThreadHeap::allocate_larger<OnFailure::kReturnNull>(std::size_t, std::size_t,
+                                                                   unsigned) noexcept;
+template void* ThreadHeap::allocate_larger<OnFailure::kThrow>(std::size_t, std::size_t,
+                                                              unsigned);
 
 void* ThreadHeap::allocate_aligned(std::size_t requested, std::size_t payload,
                                    std::size_t alignment) noexcept {

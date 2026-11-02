@@ -137,8 +137,11 @@ public:
     // ---- owner thread ------------------------------------------------------
 
     /// Allocates `payload` bytes (a multiple of 16, at most kMaxSpanPayload)
-    /// for a request of `requested` bytes, 16-byte aligned.
-    [[nodiscard]] void* allocate(std::size_t requested, std::size_t payload) noexcept;
+    /// for a request of `requested` bytes, 16-byte aligned. On failure returns
+    /// nullptr or throws std::bad_alloc, as `Policy` says.
+    template <OnFailure Policy = OnFailure::kReturnNull>
+    [[nodiscard]] void* allocate(std::size_t requested,
+                                 std::size_t payload) noexcept(Policy == OnFailure::kReturnNull);
 
     /// As allocate(), aligned to `alignment` (a power of two above 16).
     [[nodiscard]] void* allocate_aligned(std::size_t requested, std::size_t payload,
@@ -276,11 +279,15 @@ private:
     void* finish(Block* block, std::size_t need, std::size_t prev, std::size_t requested,
                  std::size_t payload) noexcept;
     /// Allocation path that has to search the bitmap and split a block.
-    void* allocate_split(std::size_t requested, std::size_t payload) noexcept;
+    template <OnFailure Policy>
+    void* allocate_split(std::size_t requested,
+                         std::size_t payload) noexcept(Policy == OnFailure::kReturnNull);
     /// Common case of allocate_split(): a request of at most kExactLimit
     /// bytes whose exact bucket is empty, with an empty inbox. Splits the head
     /// of the smallest non-empty larger bucket.
-    void* allocate_larger(std::size_t requested, std::size_t payload, unsigned bucket) noexcept;
+    template <OnFailure Policy>
+    void* allocate_larger(std::size_t requested, std::size_t payload,
+                          unsigned bucket) noexcept(Policy == OnFailure::kReturnNull);
     bool grow(std::size_t need) noexcept;
     void add_span(Span* span) noexcept;
     void release(Block* block, std::uint64_t word1) noexcept;
@@ -421,7 +428,9 @@ inline void* ThreadHeap::finish(Block* block, std::size_t need, std::size_t prev
     return payload_of(block);
 }
 
-inline void* ThreadHeap::allocate(std::size_t requested, std::size_t payload) noexcept {
+template <OnFailure Policy>
+inline void* ThreadHeap::allocate(std::size_t requested,
+                                  std::size_t payload) noexcept(Policy == OnFailure::kReturnNull) {
     const std::size_t need = payload + kHeaderSize;
     // Fast path: an empty inbox and a free block of exactly the needed size.
     if (need <= kExactLimit && inbox_.load(std::memory_order_relaxed) == 0) [[likely]] {
@@ -434,9 +443,9 @@ inline void* ThreadHeap::allocate(std::size_t requested, std::size_t payload) no
             }
             return finish(block, need, prev_field(load_word(block->word1)), requested, payload);
         }
-        return allocate_larger(requested, payload, bucket);
+        return allocate_larger<Policy>(requested, payload, bucket);
     }
-    return allocate_split(requested, payload);
+    return allocate_split<Policy>(requested, payload);
 }
 
 inline void ThreadHeap::release(Block* block, std::uint64_t word1) noexcept {

@@ -143,14 +143,34 @@ public:
     PoolCore(const PoolCore&) = delete;
     PoolCore& operator=(const PoolCore&) = delete;
 
-    void* allocate(std::size_t bytes, std::size_t alignment) noexcept {
+    /// `Policy` decides whether failure returns nullptr or throws; failures
+    /// are handled in the out-of-line paths, so the fast path is the same.
+    template <detail::OnFailure Policy>
+    void* allocate(std::size_t bytes,
+                   std::size_t alignment) noexcept(Policy == detail::OnFailure::kReturnNull) {
         if (alignment == detail::kGranule && bytes <= detail::kMaxSpanPayload) [[likely]] {
             const TlsSlot& slot = t_state.slots[id_ & (kTlsSlots - 1)];
             if (slot.pool_id == id_ && slot.heap != nullptr) [[likely]] {
-                return slot.heap->allocate(bytes, round_up(bytes, detail::kGranule));
+                return slot.heap->allocate<Policy>(bytes, round_up(bytes, detail::kGranule));
             }
         }
-        return allocate_general(bytes, alignment);
+        if constexpr (Policy == detail::OnFailure::kThrow) {
+            return allocate_general_or_throw(bytes, alignment);
+        } else {
+            return allocate_general(bytes, alignment);
+        }
+    }
+
+    NANOALLOC_NOINLINE void* allocate_general_or_throw(std::size_t bytes, std::size_t alignment) {
+        void* ptr = allocate_general(bytes, alignment);
+        if (ptr == nullptr) [[unlikely]] {
+            if (!is_power_of_two(alignment)) {
+                throw std::invalid_argument(
+                    "nanoalloc::Pool::allocate: alignment must be a power of two");
+            }
+            throw std::bad_alloc();
+        }
+        return ptr;
     }
 
     NANOALLOC_NOINLINE void* allocate_general(std::size_t bytes, std::size_t alignment) noexcept {
@@ -841,19 +861,11 @@ Pool::Pool(const PoolConfig& config) : impl_(nullptr) {
 Pool::~Pool() { delete impl_; }
 
 void* Pool::allocate(std::size_t bytes, std::size_t alignment) {
-    void* ptr = impl_->allocate(bytes, alignment);
-    if (ptr == nullptr) [[unlikely]] {
-        if (!is_power_of_two(alignment)) {
-            throw std::invalid_argument(
-                "nanoalloc::Pool::allocate: alignment must be a power of two");
-        }
-        throw std::bad_alloc();
-    }
-    return ptr;
+    return impl_->allocate<detail::OnFailure::kThrow>(bytes, alignment);
 }
 
 void* Pool::try_allocate(std::size_t bytes, std::size_t alignment) noexcept {
-    return impl_->allocate(bytes, alignment);
+    return impl_->allocate<detail::OnFailure::kReturnNull>(bytes, alignment);
 }
 
 void Pool::deallocate(void* ptr) noexcept {
