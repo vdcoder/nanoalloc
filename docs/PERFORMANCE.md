@@ -15,7 +15,8 @@ commit `05f2ee7`, and the measurement method that came out of it.
 | --- | --- | --- | --- |
 | local | Intel Xeon @ 2.80 GHz (Cascade Lake), 4 vCPUs | Linux 6.18, GCC 13.3, glibc 2.39 | Shared KVM guest; identical runs differ by up to 2x in throughput |
 | ci-zen3 | AMD EPYC 7763 (Zen 3), 4 vCPUs | GitHub-hosted ubuntu-24.04 (GCC 13.3) and windows-2022 (MSVC 19.44) | Paired benchmark job of CI run 41507316548 |
-| ci-other | Intel Xeon Platinum 8370C; AMD EPYC 9V74 (Zen 4) | windows-2022 (MSVC 19.44) | Earlier paired runs; hosted runners change CPU model between runs |
+| ci-zen4 | AMD EPYC 9V74 (Zen 4), 4 vCPUs | ubuntu-24.04 (GCC 13.3) and windows-2022 (MSVC 19.44) | Paired benchmark job of CI run 41508932419 (final commit) |
+| ci-other | Intel Xeon Platinum 8370C | windows-2022 (MSVC 19.44) | An earlier paired run; hosted runners change CPU model between runs |
 
 All builds are CMake Release (`-O3 -DNDEBUG` or MSVC `/O2`), static library.
 Profiling uses valgrind/callgrind 3.22 (instruction counts, branch and cache
@@ -123,22 +124,22 @@ coalescing cannot match.
 Below 1 means the current engine is faster. Full-scale traces; median over
 processes [range across processes].
 
-| Workload | local (GCC, 5 processes) | ci-zen3 Linux (GCC, 3) | ci-zen3 Windows (MSVC, 3) |
-| --- | --- | --- | --- |
-| small | 0.87 [0.82-0.90] | 0.93 [0.92-0.94] | 0.94 [0.92-0.94] |
-| medium | 0.90 [0.84-0.96] | 1.15 [1.06-1.22] | 1.14 [1.13-1.18] |
-| mixed | 0.78 [0.71-0.81] | 0.92 [0.90-0.94] | 0.98 [0.96-1.00] |
-| lifo | 0.38 [0.33-0.40] | 0.47 [0.45-0.55] | 0.53 [0.48-0.56] |
-| random | 0.68 [0.66-0.71] | 0.87 [0.80-0.89] | 0.93 [0.87-0.96] |
-| bursts | 0.50 [0.47-0.52] | 0.61 [0.61-0.66] | 0.72 [0.71-0.74] |
-| long_short | 1.03 [1.02-1.07] | 1.03 [1.03-1.04] | 1.11 [1.09-1.13] |
-| fragmentation | 0.92 [0.88-0.95] | 0.99 [0.97-1.05] | 1.06 [1.05-1.08] |
-| reuse | 1.01 [0.96-1.05] | 1.11 [1.06-1.23] | 1.20 [1.20-1.21] |
+| Workload | local (GCC, 5 processes) | ci-zen3 Linux (GCC, 3) | ci-zen3 Windows (MSVC, 3) | ci-zen4 Linux (GCC, 3) | ci-zen4 Windows (MSVC, 3) |
+| --- | --- | --- | --- | --- | --- |
+| small | 0.87 [0.82-0.90] | 0.93 [0.92-0.94] | 0.94 [0.92-0.94] | 0.91 [0.87-0.92] | 0.91 [0.90-0.91] |
+| medium | 0.90 [0.84-0.96] | 1.15 [1.06-1.22] | 1.14 [1.13-1.18] | 1.14 [1.11-1.16] | 1.18 [1.17-1.18] |
+| mixed | 0.78 [0.71-0.81] | 0.92 [0.90-0.94] | 0.98 [0.96-1.00] | 0.89 [0.88-0.90] | 0.93 [0.92-0.94] |
+| lifo | 0.38 [0.33-0.40] | 0.47 [0.45-0.55] | 0.53 [0.48-0.56] | 0.45 [0.41-0.45] | 0.49 [0.47-0.54] |
+| random | 0.68 [0.66-0.71] | 0.87 [0.80-0.89] | 0.93 [0.87-0.96] | 0.84 [0.83-0.86] | 0.89 [0.85-0.93] |
+| bursts | 0.50 [0.47-0.52] | 0.61 [0.61-0.66] | 0.72 [0.71-0.74] | 0.62 [0.60-0.63] | 0.64 [0.62-0.64] |
+| long_short | 1.03 [1.02-1.07] | 1.03 [1.03-1.04] | 1.11 [1.09-1.13] | 1.07 [1.07-1.09] | 1.11 [1.10-1.13] |
+| fragmentation | 0.92 [0.88-0.95] | 0.99 [0.97-1.05] | 1.06 [1.05-1.08] | 1.04 [1.00-1.05] | 1.03 [1.02-1.05] |
+| reuse | 1.01 [0.96-1.05] | 1.11 [1.06-1.23] | 1.20 [1.20-1.21] | 1.12 [1.10-1.26] | 1.11 [1.09-1.12] |
 
-The buddy allocator's relative speed depends on the CPU: on the Zen 3
-runners it is faster than the current engine in `medium`, `long_short` and
-`reuse` (and with MSVC in `fragmentation`), on the local Intel machine only
-in `long_short`. Allocation is the slower side in `medium` and
+The buddy allocator's relative speed depends on the CPU: on the AMD
+runners (Zen 3 and Zen 4) it is faster than the current engine in
+`medium`, `long_short`, `reuse` and mostly `fragmentation` (by 3-20%), on
+the local Intel machine only in `long_short` (3%). Allocation is the slower side in `medium` and
 `long_short` (current/buddy allocation time 1.31-1.55 on Zen 3), freeing in
 `reuse` (1.12-1.18).
 
@@ -298,25 +299,26 @@ changes).
 
 Full-scale traces; median over processes [range]; below 1 is faster.
 
-| Workload | A/A noise floor, local | local (GCC, 5 processes) | ci-zen3 Linux (GCC, 3) | ci-zen3 Windows (MSVC, 3) |
-| --- | --- | --- | --- | --- |
-| small | 1.00 [0.92-1.03] | 0.98 [0.96-1.16] | 0.98 [0.97-0.98] | 1.00 [1.00-1.00] |
-| medium | 0.99 [0.99-1.00] | 0.96 [0.91-0.97] | 0.91 [0.91-0.92] | 0.93 [0.92-0.95] |
-| mixed | 1.00 [1.00-1.03] | 0.95 [0.86-0.96] | 0.96 [0.94-0.97] | 0.96 [0.94-0.97] |
-| lifo | 0.96 [0.87-1.10] | 0.85 [0.81-0.93] | 0.91 [0.90-0.94] | 0.92 [0.91-0.98] |
-| random | 0.99 [0.97-0.99] | 0.92 [0.91-0.95] | 0.92 [0.91-0.95] | 0.94 [0.94-0.94] |
-| bursts | 1.01 [0.97-1.02] | 0.96 [0.94-1.40] | 0.95 [0.94-0.95] | 1.04 [1.03-1.05] |
-| long_short | 0.99 [0.98-1.01] | 0.91 [0.86-0.92] | 0.91 [0.84-0.92] | 0.93 [0.92-0.93] |
-| fragmentation | 0.99 [0.96-1.01] | 0.94 [0.93-0.98] | 0.96 [0.93-0.96] | 0.99 [0.98-0.99] |
-| reuse | 1.01 [1.00-1.02] | 0.97 [0.93-1.25] | 0.96 [0.94-0.96] | 0.98 [0.97-1.07] |
+| Workload | A/A noise floor, local | local (GCC, 5 processes) | ci-zen3 Linux (GCC, 3) | ci-zen3 Windows (MSVC, 3) | ci-zen4 Linux (GCC, 3) | ci-zen4 Windows (MSVC, 3) |
+| --- | --- | --- | --- | --- | --- | --- |
+| small | 1.00 [0.92-1.03] | 0.98 [0.96-1.16] | 0.98 [0.97-0.98] | 1.00 [1.00-1.00] | 0.97 [0.95-0.97] | 0.99 [0.99-1.00] |
+| medium | 0.99 [0.99-1.00] | 0.96 [0.91-0.97] | 0.91 [0.91-0.92] | 0.93 [0.92-0.95] | 0.93 [0.93-0.93] | 0.91 [0.90-0.91] |
+| mixed | 1.00 [1.00-1.03] | 0.95 [0.86-0.96] | 0.96 [0.94-0.97] | 0.96 [0.94-0.97] | 0.95 [0.94-0.95] | 0.95 [0.94-0.96] |
+| lifo | 0.96 [0.87-1.10] | 0.85 [0.81-0.93] | 0.91 [0.90-0.94] | 0.92 [0.91-0.98] | 0.80 [0.76-0.83] | 0.83 [0.83-0.84] |
+| random | 0.99 [0.97-0.99] | 0.92 [0.91-0.95] | 0.92 [0.91-0.95] | 0.94 [0.94-0.94] | 0.92 [0.91-0.92] | 0.97 [0.93-0.97] |
+| bursts | 1.01 [0.97-1.02] | 0.96 [0.94-1.40] | 0.95 [0.94-0.95] | 1.04 [1.03-1.05] | 0.93 [0.92-1.01] | 0.97 [0.95-0.98] |
+| long_short | 0.99 [0.98-1.01] | 0.91 [0.86-0.92] | 0.91 [0.84-0.92] | 0.93 [0.92-0.93] | 0.92 [0.91-0.92] | 0.91 [0.90-0.91] |
+| fragmentation | 0.99 [0.96-1.01] | 0.94 [0.93-0.98] | 0.96 [0.93-0.96] | 0.99 [0.98-0.99] | 0.97 [0.97-0.97] | 0.96 [0.94-0.96] |
+| reuse | 1.01 [1.00-1.02] | 0.97 [0.93-1.25] | 0.96 [0.94-0.96] | 0.98 [0.97-1.07] | 0.95 [0.92-0.96] | 0.94 [0.91-1.04] |
 
 Allocation alone (same runs): local 0.82-0.94, ci-zen3 Linux 0.83-0.92,
 ci-zen3 Windows 0.83-0.98 except `bursts` 1.07. Deallocation is unchanged
 within noise (0.97-1.03; locally `lifo`, the noisiest workload, 0.88).
 
-Not universal: `bursts` with MSVC on Zen 3 is 4% slower (allocation +7%),
-and `small` and `fragmentation` with MSVC are within noise. The gaps to the
-buddy allocator listed above remain on Zen 3.
+Not universal: `bursts` with MSVC on Zen 3 is 4% slower (allocation +7%;
+on Zen 4 the same build is 3% faster), and `small` with MSVC is within
+noise. The gaps to the buddy allocator listed above remain on the AMD
+runners.
 
 ## Optimization log (initial implementation)
 
@@ -335,12 +337,12 @@ Instruction counts are per allocate+free pair in the timed replay at scale
 
 ## Remaining gaps and ideas not pursued
 
-- `long_short` and `medium` allocation (Zen 3: 1.3-1.55x the buddy
+- `long_short` and `medium` allocation (AMD runners: 1.3-1.55x the buddy
   allocator's time): exact 16-byte classes with immediate coalescing hit
   the exact bucket for only about half of the requests; the rest split and
   move a remainder. Power-of-two classes reuse freed blocks more often, at
   the cost of 55-400 bytes of slack per allocation.
-- `reuse` frees (Zen 3: 1.1-1.2x): every merge in the exact-size range
+- `reuse` frees (AMD runners: 1.1-1.2x): every merge in the exact-size range
   changes the bucket, so nearly every free unlinks a neighbour and pushes
   the merged block.
 - Not tried: per-workload tuning of the bucket layout, or batching

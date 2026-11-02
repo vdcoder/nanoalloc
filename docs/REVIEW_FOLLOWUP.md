@@ -211,26 +211,26 @@ Allocation instructions per operation fell from 102-168 to 87-133, and
 Time ratio current / `05f2ee7`, full-scale traces, median over processes
 (below 1 is faster):
 
-| Workload | local Intel, GCC (5 processes) | Zen 3, GCC (3) | Zen 3, MSVC (3) |
-| --- | ---: | ---: | ---: |
-| small | 0.98 | 0.98 | 1.00 |
-| medium | 0.96 | 0.91 | 0.93 |
-| mixed | 0.95 | 0.96 | 0.96 |
-| lifo | 0.85 | 0.91 | 0.92 |
-| random | 0.92 | 0.92 | 0.94 |
-| bursts | 0.96 | 0.95 | 1.04 |
-| long_short | 0.91 | 0.91 | 0.93 |
-| fragmentation | 0.94 | 0.96 | 0.99 |
-| reuse | 0.97 | 0.96 | 0.98 |
+| Workload | local Intel, GCC (5 processes) | Zen 3, GCC (3) | Zen 3, MSVC (3) | Zen 4, GCC (3) | Zen 4, MSVC (3) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| small | 0.98 | 0.98 | 1.00 | 0.97 | 0.99 |
+| medium | 0.96 | 0.91 | 0.93 | 0.93 | 0.91 |
+| mixed | 0.95 | 0.96 | 0.96 | 0.95 | 0.95 |
+| lifo | 0.85 | 0.91 | 0.92 | 0.80 | 0.83 |
+| random | 0.92 | 0.92 | 0.94 | 0.92 | 0.97 |
+| bursts | 0.96 | 0.95 | 1.04 | 0.93 | 0.97 |
+| long_short | 0.91 | 0.91 | 0.93 | 0.92 | 0.91 |
+| fragmentation | 0.94 | 0.96 | 0.99 | 0.97 | 0.96 |
+| reuse | 0.97 | 0.96 | 0.98 | 0.95 | 0.94 |
 
 The self-comparison noise floor is within 0.99-1.01 for most workloads
 (`lifo` 0.96).
 
 The improvement is not universal:
-- `bursts` with MSVC on Zen 3 is 4% slower.
+- `bursts` with MSVC on Zen 3 is 4% slower (3% faster on Zen 4).
 - Against the buddy allocator, `long_short` (1.03-1.11), `reuse`
-  (1.01-1.20) and, on Zen 3, `medium` (1.14-1.15) remain slower, depending
-  on the CPU.
+  (1.01-1.20) and, on the AMD runners, `medium` (1.14-1.18) and
+  `fragmentation` (up to 1.06) remain slower, depending on the CPU.
 
 Rejected experiments, all measured:
 - branch-free list updates everywhere (+10% on `small`);
