@@ -271,8 +271,12 @@ private:
     void push_free_branchless(Block* block, unsigned bucket) noexcept;
     void pop_head_branchless(Block* head, unsigned bucket) noexcept;
     /// Stands in for the previous head when push_free_branchless() pushes
-    /// onto an empty list.
-    Block* scratch_node() noexcept { return reinterpret_cast<Block*>(scratch_); }
+    /// onto an empty list: a node whose back-link slot is scratch_link_.
+    /// Only that slot is ever written through it.
+    Block* scratch_node() noexcept {
+        return reinterpret_cast<Block*>(reinterpret_cast<std::byte*>(&scratch_link_) -
+                                        kHeaderSize);
+    }
     void unlink_free(Block* block, unsigned bucket) noexcept;
     [[nodiscard]] Fit find_fit(std::size_t need) const noexcept;
 
@@ -324,7 +328,8 @@ private:
     std::uint64_t nonempty_[kBitmapWords] = {};
     HeapCounters counters_;
     Block* heads_[kBucketCount] = {};
-    alignas(16) unsigned char scratch_[kMinFreeBlock] = {};
+    // Fits in the padding after heads_, so the heap object keeps its size.
+    Block* scratch_link_ = nullptr;
 };
 
 // =============================================================================
