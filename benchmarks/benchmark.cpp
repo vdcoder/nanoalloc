@@ -9,8 +9,7 @@
 // * Every workload is a precomputed trace (see workloads.hpp), generated from
 //   a fixed seed before any timing starts. All allocators replay the same
 //   trace through the same code path; only the allocate/deallocate calls
-//   differ. The benchmark uses only the public Pool API, so it is independent
-//   of the allocation engine.
+//   differ. The benchmark uses only the public Pool API.
 // * Each allocation writes a stamp into its first 8 bytes and its last byte;
 //   each deallocation reads them back into a checksum that is printed at the
 //   end. The workload therefore touches real memory and cannot be optimized

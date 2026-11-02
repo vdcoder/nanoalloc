@@ -3,9 +3,9 @@
 //
 // Implementation tests for the binary buddy engine (src/buddy_engine.hpp).
 //
-// Unlike the public contract tests, these tests rely on buddy-specific
-// behavior (power-of-two rounding, split/merge structure, LIFO free lists).
-// They are expected to be replaced when the allocation engine changes.
+// Unlike the public contract tests, these tests exercise the internal engine
+// directly and rely on buddy-specific behavior (power-of-two rounding,
+// split/merge structure, LIFO free lists).
 #include <nanoalloc/pool.hpp>
 
 #include <bit>

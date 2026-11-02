@@ -1,7 +1,7 @@
 # nanoalloc test suite. Self-contained: no downloaded dependencies.
 
 # --- Public contract tests ---------------------------------------------------
-# Valid for any allocation engine behind the Pool API.
+# Use only the public API; no dependence on implementation details.
 set(NANOALLOC_CONTRACT_TESTS
     test_pool
     test_stress

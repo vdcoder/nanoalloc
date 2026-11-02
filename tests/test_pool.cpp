@@ -3,9 +3,9 @@
 //
 // Public contract tests for nanoalloc::Pool.
 //
-// These tests must stay valid for any allocation engine behind the Pool API.
-// They must not assume power-of-two block sizes, a particular usable_size(),
-// or engine-specific fragmentation behavior.
+// These tests exercise only the documented public contract. They must not
+// depend on implementation details such as power-of-two block sizes, a
+// particular usable_size(), or a particular fragmentation pattern.
 #include <nanoalloc/nanoalloc.hpp>
 
 #include <algorithm>

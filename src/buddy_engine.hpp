@@ -1,8 +1,8 @@
 // nanoalloc - memory-efficient, high-performance C++ allocation
 // SPDX-License-Identifier: MIT
 //
-// Internal: binary buddy allocation engine. Not part of the public API; the
-// Pool may switch to a different engine without notice.
+// Internal: binary buddy allocation engine used by nanoalloc::Pool. Not part
+// of the public API.
 #pragma once
 
 #include <bit>

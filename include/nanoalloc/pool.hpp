@@ -1,9 +1,8 @@
 // nanoalloc - memory-efficient, high-performance C++ allocation
 // SPDX-License-Identifier: MIT
 //
-// nanoalloc::Pool: an arena-backed allocator with a stable, algorithm-neutral
-// interface. The allocation engine behind this interface is an implementation
-// detail and is expected to change between versions.
+// nanoalloc::Pool: an arena-backed allocator. The public interface does not
+// expose the allocation algorithm, which is an implementation detail.
 #pragma once
 
 #include <cstddef>
@@ -28,10 +27,9 @@ struct PoolConfig {
     ///
     /// Cost: one byte of bookkeeping per Pool::granularity bytes of arena
     /// capacity (reserved at construction, reported as
-    /// PoolStats::tracking_bytes) and one extra memory access, often a cache
-    /// miss, per allocation and deallocation. It is off by default because the
-    /// benchmarks show this cost is significant relative to the allocation
-    /// path itself. When disabled, the *_requested_bytes statistics are zero
+    /// PoolStats::tracking_bytes) and one extra table access per allocation
+    /// and deallocation. Off by default. When disabled, the *_requested_bytes
+    /// statistics are zero
     /// and PoolStats::requested_bytes_tracked is false; all other behavior is
     /// identical.
     bool track_requested_bytes = false;

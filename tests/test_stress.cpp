@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //
 // Deterministic randomized stress tests for nanoalloc::Pool (public contract
-// only; valid for any allocation engine).
+// only; no dependence on implementation details).
 //
 // Every scenario keeps a record of each live allocation, fills its whole
 // usable range with a per-allocation pattern, and continuously checks:
