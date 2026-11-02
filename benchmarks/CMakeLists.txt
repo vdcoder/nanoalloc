@@ -51,8 +51,27 @@ if(NANOALLOC_REFERENCE_SOURCE_DIR)
     target_include_directories(nanoalloc_paired PRIVATE
         ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
     target_compile_features(nanoalloc_paired PRIVATE cxx_std_20)
+    # paired.cpp includes a copy of the reference's pool.hpp without
+    # "#pragma once": GCC treats headers with identical contents and
+    # timestamps as one file, so the reference header would be skipped
+    # whenever it equals the current one.
+    set(_nanobench_reference_header "${_nanobench_reference}/include/nanoalloc/pool.hpp")
+    set(_nanobench_reference_copy
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/nanoalloc_reference_pool.hpp")
+    file(READ "${_nanobench_reference_header}" _nanobench_header_text)
+    string(REPLACE "#pragma once" "" _nanobench_header_text "${_nanobench_header_text}")
+    set(_nanobench_header_text
+        "// Generated from ${_nanobench_reference_header}; do not edit.\n${_nanobench_header_text}")
+    set(_nanobench_header_old "")
+    if(EXISTS "${_nanobench_reference_copy}")
+        file(READ "${_nanobench_reference_copy}" _nanobench_header_old)
+    endif()
+    if(NOT _nanobench_header_old STREQUAL _nanobench_header_text)
+        file(WRITE "${_nanobench_reference_copy}" "${_nanobench_header_text}")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_nanobench_reference_header}")
     target_compile_definitions(nanoalloc_paired PRIVATE
-        NANOALLOC_REFERENCE_POOL_HEADER="${_nanobench_reference}/include/nanoalloc/pool.hpp")
+        NANOALLOC_REFERENCE_POOL_HEADER="${_nanobench_reference_copy}")
     target_link_libraries(nanoalloc_paired PRIVATE Threads::Threads)
     nanoalloc_apply_warnings(nanoalloc_paired)
     list(APPEND _nanobench_targets nanoalloc_paired)

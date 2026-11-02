@@ -162,9 +162,13 @@ jobs:
             else
               exe="build-$name/benchmarks/nanoalloc_paired"
             fi
-            echo "== current $(git -C current rev-parse --short HEAD) vs $ref ($commit)" |
-              tee "results/paired-$name.txt"
-            "$exe" --scale "$SCALE" --iterations "$ITERATIONS" | tee -a "results/paired-$name.txt"
+            # Several processes: memory and code placement differ between
+            # processes and can favour one side within a single process.
+            for process in 1 2 3; do
+              echo "== current $(git -C current rev-parse --short HEAD) vs $ref ($commit)," \
+                   "process $process" | tee -a "results/paired-$name.txt"
+              "$exe" --scale "$SCALE" --iterations "$ITERATIONS" | tee -a "results/paired-$name.txt"
+            done
             last_build="build-$name"
           done
           # Absolute numbers of this commit against the system allocator.

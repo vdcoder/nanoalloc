@@ -18,6 +18,13 @@
 // nanoalloc_bench would choose, write and read a stamp in every block, and
 // must produce the same checksum.
 //
+// Within one process, memory and code placement (address-space layout
+// randomization, physical pages) can favour one side consistently: comparing
+// a build with an identical copy of itself has shown single-process medians
+// up to 20% away from 1 on the smallest workload (reuse). Run several
+// processes and compare their medians; such a self-comparison measures the
+// noise floor.
+//
 // Build: configure with -DNANOALLOC_REFERENCE_SOURCE_DIR=<another nanoalloc
 // source tree> (for example a worktree of an earlier commit); the target is
 // nanoalloc_paired.
