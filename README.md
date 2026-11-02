@@ -505,6 +505,7 @@ tests/               contract, stress, thread, engine and misuse tests
 benchmarks/          nanoalloc_bench, nanoalloc_mtbench, nanoalloc_paired, compare_builds.py
 examples/            runnable usage examples
 docs/                performance log, review follow-up report, thread retirement
+evaluation/          standalone evaluation package (not part of the library; see its README)
 ```
 
 ## License

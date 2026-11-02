@@ -331,6 +331,33 @@ multithreaded benchmark showed overlapping distributions (4 threads,
 10 alternating runs per build). Details and reclamation measurements are in
 [THREAD_RETIREMENT.md](THREAD_RETIREMENT.md).
 
+## Final evaluation against the frozen baseline
+
+Measured with the standalone evaluation package in [`evaluation/`](../evaluation/README.md),
+which builds the frozen buddy baseline (`f3aad1b`) and a candidate tree
+separately with identical flags and times both through the baseline's public
+API. Image `nanoalloc-evaluation:1.0` (Ubuntu 24.04, GCC 13.3, CMake 3.28,
+`-O3 -DNDEBUG -std=c++20`), `--network none`, local machine (Intel Xeon
+@ 2.80 GHz, 4 vCPUs), default settings (11 rounds, 2 warmup and 9 measured
+replays per process, full-scale traces), threshold 90%:
+
+| Candidate | Overall | Decision interval | A/A | Verdict |
+| --- | ---: | ---: | ---: | --- |
+| this branch | 132.5% | 125.8-135.5% | 100.0% | PASS (own tests 20/20, every conformance check) |
+| baseline, identical copy | 99.9% | 97.8-112.3% | 99.5% | PASS (packing reported, not enforced) |
+
+Per workload (this branch): small 118.9, medium 98.3, mixed 121.2, lifo 322.4,
+random 141.1, bursts 204.5, long_short 93.7, fragmentation 105.5, reuse 96.4.
+Smallest capacity that completes each workload, this branch / baseline:
+long_short 18.5 / 23.9 MiB, lifo 13.2 / 16.1 MiB, mixed 9.0 / 9.8 MiB;
+reuse 21.8 / 16.0 KiB.
+
+The evaluator's own checks, in the same image: a copy of the baseline slowed by
+a busy-wait scores 70.3% (FAIL), this branch with a similar busy-wait 67.3%
+(FAIL) and with a smaller one 117.0% (PASS), a candidate whose `usable_size()`
+over-reports by 16 bytes fails the correctness gate, and a modified baseline is
+rejected before anything is built.
+
 ## Optimization log (initial implementation)
 
 Instruction counts are per allocate+free pair in the timed replay at scale
