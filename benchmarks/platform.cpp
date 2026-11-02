@@ -8,7 +8,8 @@
 #include <string>
 #include <thread>
 
-#include "nanobench_build_info.hpp"
+#include "nanobench_build_flags.hpp"
+#include "nanobench_build_type.hpp"
 
 #if defined(__GLIBC__)
 #include <gnu/libc-version.h>
@@ -46,6 +47,32 @@ std::string compiler_name() {
 #else
     return "unknown compiler";
 #endif
+}
+
+/// Flags CMake adds for `build_type` (configuration names are case-insensitive).
+std::string configuration_flags(const std::string& build_type) {
+    struct Entry {
+        const char* configuration;
+        const char* flags;
+    };
+    static const Entry entries[] = {
+        {"debug", NANOBENCH_CXX_FLAGS_DEBUG},
+        {"release", NANOBENCH_CXX_FLAGS_RELEASE},
+        {"relwithdebinfo", NANOBENCH_CXX_FLAGS_RELWITHDEBINFO},
+        {"minsizerel", NANOBENCH_CXX_FLAGS_MINSIZEREL},
+    };
+    std::string lowered = build_type;
+    for (char& c : lowered) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    for (const Entry& entry : entries) {
+        if (lowered == entry.configuration) {
+            return entry.flags;
+        }
+    }
+    return {};
 }
 
 std::string trim(std::string text) {
@@ -138,7 +165,8 @@ PlatformInfo platform_info() {
     PlatformInfo info;
     info.compiler = compiler_name();
     info.build_type = NANOBENCH_BUILD_TYPE;
-    info.cxx_flags = trim(NANOBENCH_CXX_FLAGS);
+    info.cxx_flags =
+        trim(std::string(NANOBENCH_CXX_FLAGS) + " " + configuration_flags(info.build_type));
     info.sanitizers = NANOBENCH_SANITIZE;
 #if defined(__OPTIMIZE__) || (defined(_MSC_VER) && !defined(_DEBUG))
     info.optimized = true;

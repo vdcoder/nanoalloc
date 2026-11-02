@@ -41,7 +41,13 @@ endfunction()
 # Enables the sanitizers listed in NANOALLOC_SANITIZE (a ;- or ,-separated
 # list such as "address;undefined") for all targets created afterwards in the
 # calling directory and its subdirectories. MSVC only supports "address".
+#
+# Also sets NANOALLOC_SANITIZER_LINK_OPTIONS to the link options that code
+# outside this directory needs in order to link an instrumented nanoalloc
+# (empty on MSVC, whose /fsanitize=address objects name their runtime
+# libraries themselves).
 macro(nanoalloc_enable_sanitizers)
+    set(NANOALLOC_SANITIZER_LINK_OPTIONS "")
     if(NANOALLOC_SANITIZE)
         string(REPLACE "," ";" _nanoalloc_sanitizers "${NANOALLOC_SANITIZE}")
         if(MSVC)
@@ -59,6 +65,7 @@ macro(nanoalloc_enable_sanitizers)
             add_compile_options(-fsanitize=${_nanoalloc_joined}
                                 -fno-omit-frame-pointer -fno-sanitize-recover=all)
             add_link_options(-fsanitize=${_nanoalloc_joined})
+            set(NANOALLOC_SANITIZER_LINK_OPTIONS -fsanitize=${_nanoalloc_joined})
         endif()
         message(STATUS "nanoalloc: sanitizers enabled: ${NANOALLOC_SANITIZE}")
     endif()

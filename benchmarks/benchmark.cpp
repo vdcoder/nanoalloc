@@ -87,9 +87,9 @@ std::vector<std::string> split_list(const std::string& text) {
 void print_usage() {
     std::printf(
         "usage: nanoalloc_bench [options]\n"
-        "  --iterations N     measured iterations per workload (default 9)\n"
-        "  --warmup N         unmeasured warmup iterations (default 1)\n"
-        "  --scale F          multiply operation counts by F (default 1.0)\n"
+        "  --iterations N     measured iterations per workload, 1-100000 (default 9)\n"
+        "  --warmup N         unmeasured warmup iterations, 0-100000 (default 1)\n"
+        "  --scale F          multiply operation counts by F, 0 < F <= 1000 (default 1.0)\n"
         "  --quick            shorthand for --scale 0.1 --iterations 3\n"
         "  --seed N           trace seed (default 0x6E616E6F)\n"
         "  --workload LIST    comma-separated workloads (default: all)\n"
@@ -97,6 +97,25 @@ void print_usage() {
         "  --csv PATH         also write all results as CSV\n"
         "  --verbose          print every measured iteration\n"
         "  --list             list workloads and exit\n");
+}
+
+// Bounds keep warmup + iterations far from overflow and runs finite.
+constexpr unsigned long long kMaxIterations = 100000;
+constexpr double kMaxScale = 1000.0;
+
+/// Parses a decimal count and checks that it lies in [low, high]. Rejects
+/// signs, spaces and trailing characters, which std::stoul would accept.
+unsigned parse_count(const std::string& option, const std::string& text,
+                     unsigned long long low, unsigned long long high) {
+    const bool digits_only =
+        !text.empty() && text.size() <= 12 &&
+        std::all_of(text.begin(), text.end(), [](char c) { return c >= '0' && c <= '9'; });
+    const unsigned long long value = digits_only ? std::stoull(text) : 0;
+    if (!digits_only || value < low || value > high) {
+        throw std::invalid_argument(option + " expects an integer from " + std::to_string(low) +
+                                    " to " + std::to_string(high) + ", got '" + text + "'");
+    }
+    return static_cast<unsigned>(value);
 }
 
 Options parse_options(int argc, char** argv) {
@@ -110,9 +129,9 @@ Options parse_options(int argc, char** argv) {
             return argv[++i];
         };
         if (arg == "--iterations") {
-            options.iterations = static_cast<unsigned>(std::stoul(value()));
+            options.iterations = parse_count(arg, value(), 1, kMaxIterations);
         } else if (arg == "--warmup") {
-            options.warmup = static_cast<unsigned>(std::stoul(value()));
+            options.warmup = parse_count(arg, value(), 0, kMaxIterations);
         } else if (arg == "--scale") {
             options.scale = std::stod(value());
         } else if (arg == "--quick") {
@@ -140,8 +159,9 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("unknown option " + arg);
         }
     }
-    if (options.iterations == 0 || !(options.scale > 0)) {
-        throw std::invalid_argument("iterations and scale must be positive");
+    if (!(options.scale > 0 && options.scale <= kMaxScale)) {  // also rejects NaN
+        throw std::invalid_argument("--scale expects a value in (0, " +
+                                    std::to_string(static_cast<int>(kMaxScale)) + "]");
     }
     for (const std::string& allocator : options.allocators) {
         if (allocator != "system" && allocator != "nanoalloc" && allocator != "nanoalloc-tracked") {
@@ -420,6 +440,9 @@ struct Result {
 };
 
 double median(std::vector<double> values) {
+    if (values.empty()) {
+        return 0.0;
+    }
     std::sort(values.begin(), values.end());
     const std::size_t n = values.size();
     return n % 2 == 1 ? values[n / 2] : 0.5 * (values[n / 2 - 1] + values[n / 2]);

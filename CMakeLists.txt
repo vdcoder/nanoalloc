@@ -63,6 +63,12 @@ if(BUILD_SHARED_LIBS)
     target_compile_definitions(nanoalloc PUBLIC NANOALLOC_SHARED PRIVATE NANOALLOC_BUILDING)
 endif()
 nanoalloc_apply_strict_warnings(nanoalloc)
+# An instrumented library can only be linked together with the sanitizer
+# runtimes. The directory-wide options above do not reach parent projects
+# (add_subdirectory) or installed-package users, so publish them on the target.
+if(NANOALLOC_SANITIZER_LINK_OPTIONS)
+    target_link_options(nanoalloc INTERFACE ${NANOALLOC_SANITIZER_LINK_OPTIONS})
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests, benchmarks, examples
