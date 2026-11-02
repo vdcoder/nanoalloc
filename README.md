@@ -1,42 +1,42 @@
 # nanoalloc
 
-**nanoalloc is a C++20 memory allocator library focused on combining high
-runtime performance with efficient memory utilization. Its goal is to provide
-fast allocation and deallocation while minimizing wasted memory.**
-
-This release (0.1) provides an arena-backed pool built on a binary buddy
-allocator, standard-library adapters, statistics, a dependency-free test
-suite and a benchmark tool that reports both speed and memory use.
+**nanoalloc is a C++20 memory allocator library that aims to combine memory
+efficiency with runtime efficiency: fast allocation and deallocation, from
+many threads, with no more than 15 bytes of unused payload per allocation.**
 
 - [Features](#features)
 - [Supported platforms](#supported-platforms)
 - [Building](#building)
 - [Usage](#usage)
+- [Threads](#threads)
+- [How it works](#how-it-works)
+- [Guarantees](#guarantees)
 - [API reference](#api-reference)
-- [Correctness guarantees](#correctness-guarantees)
 - [Memory accounting](#memory-accounting)
-- [Implementation](#implementation)
+- [Performance](#performance)
 - [Testing](#testing)
-- [Benchmarking](#benchmarking)
 - [Limitations](#limitations)
 
 ## Features
 
-- `nanoalloc::Pool`: an arena-backed allocator. One contiguous arena is
-  reserved at construction (RAII); allocation and deallocation never call the
-  system allocator, and an exhausted arena is reported, never silently
-  redirected to `malloc`/`new`.
-- 16-byte minimum alignment; any power-of-two alignment up to 4096 bytes.
+- `nanoalloc::Pool`: a capacity-bounded memory pool. Each thread allocates
+  from its own spans without locks; any thread may free any block.
+- **16-byte granularity**: a request of `n` bytes gets exactly `n` rounded up
+  to a multiple of 16 usable bytes (at most 15 bytes of slack), 16-byte
+  aligned, plus a 16-byte header. Power-of-two alignments up to 4096 bytes are
+  supported without changing the payload size.
+- **Immediate coalescing**: a freed block is merged with free neighbours at
+  once, so free memory is always made of maximal blocks.
+- **Lock-free cross-thread frees**: a block freed by another thread is queued
+  in its owner's inbox and released by the owner.
 - Size-free deallocation: `deallocate(ptr)` and `usable_size(ptr)` need only
   the pointer.
-- `nanoalloc::MemoryResource`, a `std::pmr::memory_resource` adapter.
-- `nanoalloc::Allocator<T>`, a C++20 standard allocator for ordinary STL
-  containers.
-- `PoolStats`: requested, usable and consumed bytes (live and peak), free
-  space, the largest available block, metadata size, and allocation, failure,
-  split and merge counters.
-- Misuse detection (foreign pointers, pointers into the middle of a block,
-  most double frees) and AddressSanitizer integration that poisons free arena
+- `nanoalloc::MemoryResource` (`std::pmr::memory_resource`) and
+  `nanoalloc::Allocator<T>` (standard C++20 allocator) adapters.
+- Exact statistics of requested, usable and consumed bytes, headers, spans,
+  pending remote frees, splits and merges, from per-thread counters.
+- Misuse detection (foreign, misaligned and interior pointers, double frees,
+  frees after the owning thread exited) and AddressSanitizer poisoning of free
   memory.
 - No third-party dependencies.
 
@@ -44,17 +44,16 @@ suite and a benchmark tool that reports both speed and memory use.
 
 | Platform | Compilers | Verified by |
 | --- | --- | --- |
-| Linux x86-64 | GCC 13, Clang 18 | Local runs and CI (Debug, Release, ASan + UBSan, shared library) |
-| Windows x64 | MSVC 2022 | CI (Debug, Release, ASan) |
+| Linux x86-64 | GCC 13, Clang 18 | Local runs and CI: Debug, Release, ASan + UBSan, TSan, shared library |
+| Windows x64 | MSVC 2022 | CI: Debug, Release, ASan |
 
-Any C++20 compiler with `<memory_resource>` and `<bit>` should work. 32-bit
-targets are supported by the code but are not tested.
+The code uses only standard C++20 (`<atomic>`, `<bit>`, `thread_local`) and
+should build on other 64-bit platforms such as ARM64, but only the platforms
+above are tested; 32-bit targets compile but are not tested.
 
 ## Building
 
 Requirements: CMake 3.20 or newer (3.21 for presets) and a C++20 compiler.
-
-With presets (Ninja):
 
 ```bash
 cmake --preset release
@@ -62,7 +61,7 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-Without presets (any generator):
+Without presets:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -70,43 +69,22 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-With AddressSanitizer and UndefinedBehaviorSanitizer (GCC or Clang):
+Sanitizers (GCC or Clang; TSan uses Clang):
 
 ```bash
-cmake --preset sanitize
-cmake --build --preset sanitize
-ctest --preset sanitize
+cmake --preset sanitize && cmake --build --preset sanitize && ctest --preset sanitize
+cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan
 ```
 
-On Windows, `cmake --preset msvc` followed by
-`cmake --build --preset msvc-release` and `ctest --preset msvc-release` uses
-Visual Studio 2022; the `msvc-asan` presets enable MSVC's AddressSanitizer.
+On Windows, `cmake --preset msvc`, then `cmake --build --preset msvc-release`
+and `ctest --preset msvc-release` (the `msvc-asan` presets enable ASan).
 
-The build does not depend on version-control metadata; a plain source copy
-builds and tests the same way.
-
-| CMake option | Default | Meaning |
-| --- | --- | --- |
-| `NANOALLOC_BUILD_TESTS` | ON at top level | Build the test suite |
-| `NANOALLOC_BUILD_BENCHMARKS` | ON at top level | Build `nanoalloc_bench` |
-| `NANOALLOC_BUILD_EXAMPLES` | ON at top level | Build (and test-run) the examples |
-| `NANOALLOC_SANITIZE` | empty | e.g. `address;undefined` |
-| `NANOALLOC_WARNINGS_AS_ERRORS` | OFF | `-Werror` / `/WX` |
-| `BUILD_SHARED_LIBS` | OFF | Build a shared library |
-
-The single-config default build type is `Release`.
-
-### Using nanoalloc from another CMake project
-
-```cmake
-# After `cmake --install build --prefix <prefix>`:
-find_package(nanoalloc 0.1 REQUIRED)
-target_link_libraries(my_app PRIVATE nanoalloc::nanoalloc)
-
-# Or vendored:
-add_subdirectory(third_party/nanoalloc)
-target_link_libraries(my_app PRIVATE nanoalloc::nanoalloc)
-```
+The build does not depend on version-control metadata. CMake options:
+`NANOALLOC_BUILD_TESTS`, `NANOALLOC_BUILD_BENCHMARKS`,
+`NANOALLOC_BUILD_EXAMPLES` (all ON at top level), `NANOALLOC_SANITIZE`
+(e.g. `address;undefined` or `thread`), `NANOALLOC_WARNINGS_AS_ERRORS`,
+`BUILD_SHARED_LIBS`. The installed package is used with
+`find_package(nanoalloc 0.1 REQUIRED)` and `nanoalloc::nanoalloc`.
 
 ## Usage
 
@@ -118,10 +96,10 @@ target_link_libraries(my_app PRIVATE nanoalloc::nanoalloc)
 #include <cstdio>
 
 int main() {
-    nanoalloc::Pool pool({1024 * 1024});  // 1 MiB arena
+    nanoalloc::Pool pool({64 * 1024 * 1024});  // 64 MiB budget
 
-    void* data = pool.allocate(100);      // 16-byte aligned
-    void* line = pool.allocate(64, 64);   // 64-byte aligned
+    void* data = pool.allocate(100);      // 112 usable bytes, 16-byte aligned
+    void* line = pool.allocate(64, 64);   // 64 usable bytes, 64-byte aligned
 
     std::printf("usable: %zu bytes\n", pool.usable_size(data));
 
@@ -129,8 +107,8 @@ int main() {
     pool.deallocate(data);
 
     const nanoalloc::PoolStats stats = pool.stats();
-    std::printf("live: %zu, free: %zu of %zu bytes\n", stats.live_allocations,
-                stats.free_bytes, stats.capacity_bytes);
+    std::printf("live: %zu, reserved: %zu of %zu bytes\n", stats.live_allocations,
+                stats.reserved_bytes, stats.capacity_bytes);
 }
 ```
 
@@ -188,270 +166,262 @@ int main() {
 }
 ```
 
-Complete, runnable versions are in [`examples/`](examples); they are built and
-executed by the test suite.
+Runnable versions are in [`examples/`](examples) and are executed by the test
+suite. The pool must outlive every allocation, adapter and container that
+uses it; destroying the pool releases all of its memory at once without
+running destructors. A `Pool` is neither copyable nor movable.
 
-### Lifetime and threading rules
+## Threads
 
-- The `Pool` must outlive every allocation, every `MemoryResource` and
-  `Allocator` that refers to it, and every container using them. The adapters
-  never own the pool. Destroying a pool releases its whole arena at once and
-  does not run destructors of objects still living in it.
-- A `Pool` is not copyable or movable (adapters hold its address). Use
-  `std::unique_ptr<nanoalloc::Pool>` for a movable handle.
-- **A `Pool` is not thread-safe.** Every call on the same pool, including
-  const ones such as `stats()` and `usable_size()`, must be externally
-  synchronized; concurrent calls are data races. Separate pools may be used
-  from separate threads. The pool has no internal locking.
+Allocation, deallocation, `usable_size()`, `owns()`, `stats()` and
+`drain_pending_frees()` may be called from any number of threads at the same
+time. `verify_integrity()` requires that no other thread uses the pool.
+
+**Cross-thread frees.** A thread may free a block allocated by another
+thread. The block is queued in the owner's inbox; the owner releases it (and
+merges it with its neighbours) at its next allocation or deallocation in that
+pool, or when it calls `pool.drain_pending_frees()`. Until then the block
+still counts as live memory (`PoolStats::pending_remote_frees`). A thread that
+frees memory for others but rarely allocates itself can call
+`drain_pending_frees()` to return memory promptly. There is no background
+thread or timer.
+
+**Thread lifetime contract.** Memory allocated by a thread must not be
+accessed or freed by another thread after the allocating thread has begun to
+terminate. All cross-thread frees of a thread's blocks must have completed,
+with proper synchronization (for example, by joining the freeing threads),
+before that thread exits. When a thread exits it drains its inbox and returns
+its completely free spans to the pool for other threads; spans that still
+hold live blocks stay reserved until the pool is destroyed. Blocks of an
+exited thread may still be read, but freeing one is detected and reported as
+a fatal error.
+
+## How it works
+
+**Spans and thread heaps.** At construction the pool reserves its budget as
+one arena (pages are typically committed lazily by the operating system).
+The first time a thread allocates from a pool it gets a *thread heap* for
+that pool, found through a small `thread_local` cache, and on demand the
+thread heap acquires 1 MiB *spans* from the arena under a short pool-wide
+lock. A thread keeps the spans it acquired while it runs.
+
+**Blocks.** A span is divided into variable-sized blocks, each a 16-byte
+header followed by its payload; sizes are multiples of 16. The header holds:
+
+- word 0: the owning thread heap and the block state (allocated, free, or
+  pending a remote free); for a pending block it links the block into the
+  owner's inbox instead;
+- word 1: the block size, the size of the previous block in the span, the
+  payload slack (so requested sizes are known exactly) and a check value.
+
+A block's physical neighbours are found from its own size and the previous
+size, so freeing and merging never search. Spans start with a small header
+and end with a permanently allocated fence block, so blocks never merge
+across span boundaries.
+
+**Free buckets.** Every free block of a thread's spans is on one of 384
+doubly linked lists by size: 256 buckets of 16-byte steps up to 4 KiB, then
+16 buckets per power of two up to 1 MiB. A 6-word bitmap marks non-empty
+buckets and a summary word marks non-empty bitmap words, so the smallest
+suitable non-empty bucket is found with two count-trailing-zeros operations.
+Buckets above 4 KiB hold a range of sizes; the search takes such a bucket's
+first block only if it is large enough, otherwise it moves to larger buckets,
+and only then examines the rest of the bucket, so an undersized block is
+never returned.
+
+**Allocation.** A request for `n` bytes needs a block of `round_up(n, 16) +
+16` bytes. If the exact-size bucket has a block, it is taken whole. Otherwise
+the smallest suitable block is split: the allocation is carved from its end,
+so the remaining free block keeps its header and often its bucket. A
+remainder of exactly 16 bytes cannot hold list links; it stays a header-only
+free *fragment* that is merged as soon as a neighbour is freed, so the
+allocation never receives more than its rounded payload. Larger alignments
+place the block at an aligned position inside a free block and keep the
+pieces before and after it free.
+
+**Deallocation.** A local free merges the block with free neighbours
+immediately and puts the result in its bucket. A remote free changes the
+block's state to pending with one compare-and-swap and pushes it onto the
+owner's inbox with a second one; the owner later detaches the whole inbox
+with one atomic exchange and frees the blocks normally.
+
+**Oversized requests.** Requests that do not fit in a span (more than
+1 MiB - 80 bytes, or a smaller request with a large alignment) are served by
+the system allocator with the same 16-byte header in front, are charged
+against the pool's budget, and are released by `deallocate()` as usual.
+
+## Guarantees
+
+- Every pointer is aligned to at least 16 bytes and to the requested
+  power-of-two alignment (up to 4096).
+- Span allocations have exactly `round_up(n, 16)` usable bytes: at most 15
+  bytes of payload slack. The 16-byte header is reported separately as
+  allocator overhead.
+- The usable ranges of live allocations never overlap.
+- Zero-byte requests return a unique non-null pointer (a header-only block)
+  that must be released like any other allocation.
+- A failed allocation leaves the pool unchanged apart from
+  `failed_allocation_count` (and possibly a newly created, empty thread
+  heap).
+- Allocation and deallocation never call the system allocator except for
+  oversized requests; a thread's first allocation creates its heap inside the
+  arena.
+- The pool never exceeds its budget and never falls back to another allocator.
+- In single-threaded use, once everything has been freed `free_bytes` equals
+  `capacity_bytes` and `largest_free_block` returns to its initial value.
+- Misuse (a pointer this pool did not return, an interior pointer, a double
+  free) is undefined behaviour; the common cases are detected and terminate
+  the process with a `nanoalloc: fatal error: ...` message.
 
 ## API reference
 
-All public names are in namespace `nanoalloc`; headers are under
-`include/nanoalloc/`. `<nanoalloc/nanoalloc.hpp>` includes everything. The
-public headers contain no implementation-specific types.
+All names are in namespace `nanoalloc`; `<nanoalloc/nanoalloc.hpp>` includes
+everything.
 
-### PoolConfig
-
-| Member | Default | Meaning |
+| `PoolConfig` member | Default | Meaning |
 | --- | --- | --- |
-| `capacity_bytes` | 0 (invalid) | Arena size; rounded up to a multiple of 16 |
-| `track_requested_bytes` | `false` | Keep exact requested-byte statistics (see [Memory accounting](#memory-accounting)) |
+| `capacity_bytes` | 0 (invalid) | Memory budget: arena for spans and thread heaps, plus oversized allocations |
+| `track_requested_bytes` | `true` | Report requested-byte statistics (free; `false` reports them as zero) |
 
-### Pool
-
-| Member | Behavior |
+| `Pool` member | Behaviour |
 | --- | --- |
-| `explicit Pool(const PoolConfig&)` | Reserves the arena. `std::invalid_argument` if capacity is 0 or above `max_capacity`; `std::bad_alloc` if memory cannot be obtained |
-| `void* allocate(bytes, alignment = 16)` | At least `bytes` bytes, aligned to `max(alignment, 16)`. Throws `std::invalid_argument` for a zero or non-power-of-two alignment, `std::bad_alloc` if it cannot be satisfied (including alignment above 4096) |
-| `void* try_allocate(bytes, alignment = 16) noexcept` | As `allocate`, returning `nullptr` on any failure |
-| `void deallocate(void* ptr) noexcept` | Releases `ptr`; `nullptr` is a no-op |
-| `size_t usable_size(const void* ptr) const noexcept` | Bytes the caller may use at `ptr` (>= requested); 0 for `nullptr` |
-| `bool owns(const void* ptr) const noexcept` | Whether `ptr` lies inside the arena |
-| `size_t capacity() const noexcept` | Arena size |
-| `PoolStats stats() const noexcept` | Statistics snapshot, O(1) |
-| `bool verify_integrity() const noexcept` | Full internal consistency check, O(capacity); for tests and debugging |
-| `min_alignment`, `max_alignment`, `granularity`, `max_capacity` | 16, 4096, 16, 2^62 (2^30 on 32-bit) |
+| `explicit Pool(const PoolConfig&)` | Reserves the arena. `std::invalid_argument` for capacity 0 or above `max_capacity`; `std::bad_alloc` if the memory cannot be obtained |
+| `void* allocate(bytes, alignment = 16)` | `std::invalid_argument` for a zero or non-power-of-two alignment; `std::bad_alloc` if the request cannot be satisfied or the alignment exceeds 4096 |
+| `void* try_allocate(bytes, alignment = 16) noexcept` | As `allocate`, `nullptr` on any failure |
+| `void deallocate(void* ptr) noexcept` | Releases `ptr` from any thread; `nullptr` is a no-op |
+| `void drain_pending_frees() noexcept` | Releases blocks other threads freed on behalf of the calling thread |
+| `size_t usable_size(const void* ptr) const noexcept` | Usable bytes at `ptr`; 0 for `nullptr` |
+| `bool owns(const void* ptr) const noexcept` | Whether `ptr` lies in the arena or in a live oversized allocation |
+| `size_t capacity() const noexcept` | The budget |
+| `PoolStats stats() const noexcept` | Statistics snapshot (takes the pool lock) |
+| `bool verify_integrity() const noexcept` | Full consistency check; no concurrent use allowed |
+| `min_alignment`, `max_alignment`, `granularity`, `header_size`, `max_capacity` | 16, 4096, 16, 16, 2^62 |
 
-### MemoryResource and Allocator&lt;T&gt;
+`MemoryResource(Pool&)` implements `std::pmr::memory_resource` (equal when it
+refers to the same pool). `Allocator<T>(Pool&)` is a one-pointer C++20
+allocator: rebinding keeps the pool, allocators compare equal iff their pools
+are the same, it propagates on copy assignment, move assignment and swap, and
+storage is aligned to `max(alignof(T), 16)`.
 
-`MemoryResource(Pool&)` implements `std::pmr::memory_resource`. Two resources
-compare equal when they refer to the same pool. Allocation failures throw
-`std::bad_alloc`; alignments follow the pool's rules.
-
-`Allocator<T>(Pool&)` is a one-pointer handle satisfying the C++20 Allocator
-requirements:
-
-- rebinding preserves the pool; allocators are equal iff their pools are the
-  same (`is_always_equal` is false);
-- it propagates on container copy assignment, move assignment and swap, so a
-  container always draws from the pool its allocator names, and move
-  assignment never copies elements;
-- storage is aligned to `max(alignof(T), 16)`; `alignof(T) > 4096` is rejected
-  at compile time;
-- it is not default-constructible, so a pool must always be named;
-- `allocate(n)` throws `std::bad_array_new_length` if `n * sizeof(T)`
-  overflows and `std::bad_alloc` if the pool is exhausted.
-
-## Correctness guarantees
-
-- **Alignment**: every pointer is aligned to at least 16 bytes and to the
-  requested power-of-two alignment (up to 4096).
-- **Usable size**: `usable_size(p)` is at least the requested size, and the
-  caller may read and write all of it.
-- **No overlap**: the usable ranges of live allocations never overlap.
-- **Zero-byte requests** return a unique, non-null, 16-byte aligned pointer
-  that must be released like any other allocation.
-- **Failure** leaves the pool unchanged apart from
-  `PoolStats::failed_allocation_count` (strong exception guarantee).
-- **No fallback**: when the arena cannot satisfy a request, the request fails.
-- **No allocation after construction**: allocate and deallocate never call the
-  global allocation functions or the C allocator.
-- **Recovery**: once every allocation has been released, `free_bytes` equals
-  `capacity_bytes` and `largest_free_block` returns to its initial value.
-- **Misuse** (a pointer not returned by this pool, already released, or into
-  the middle of a block) is undefined behavior. The pool detects the common
-  cases and terminates with a `nanoalloc: fatal error: ...` diagnostic instead
-  of corrupting its state.
+**Changes from release 0.1** (the buddy allocator): pools are now usable from
+many threads; `capacity_bytes` is a budget that also covers oversized
+allocations served by the system allocator; requested-byte tracking is on by
+default and free; `PoolStats` gained span, header, inbox, fragment and
+oversized-allocation fields; `drain_pending_frees()` is new.
 
 ## Memory accounting
 
-`PoolStats` distinguishes four quantities:
-
 | Term | Meaning |
 | --- | --- |
-| requested | the `bytes` argument passed to `allocate` |
-| usable | what `usable_size()` reports; the caller may use all of it (>= requested) |
-| consumed | arena bytes made unavailable by an allocation, including any in-arena per-allocation overhead (>= usable; equal in this implementation, which stores no per-allocation header) |
-| reserved | memory obtained from the system: the arena (`capacity_bytes`) plus bookkeeping (`metadata_bytes`, `tracking_bytes`) |
+| requested | the `bytes` passed to `allocate` |
+| usable | `usable_size()`: `round_up(bytes, 16)` for span blocks |
+| consumed | usable bytes plus the 16-byte header (span blocks), or the whole system allocation (oversized) |
+| reserved | arena memory carved for spans and thread heaps, plus oversized system memory |
 
-*Payload slack* is usable − requested. *Fragmentation* is free arena memory
-that cannot serve a request because it is not contiguous; compare
-`free_bytes` with `largest_free_block`.
+*Payload slack* is usable − requested (0-15 bytes per span allocation). *Total
+allocator overhead* additionally includes the 16-byte headers
+(`header_bytes`), bookkeeping (`metadata_bytes`: thread heaps, span headers
+and fences), header-only free fragments (`fragment_bytes`) and free memory
+retained in spans (`reserved_bytes` − `live_consumed_bytes`).
 
-| Field | Meaning |
-| --- | --- |
-| `capacity_bytes` | Arena size |
-| `metadata_bytes` | Allocator bookkeeping held outside the arena (allocated at construction) |
-| `tracking_bytes` | Requested-size table; 0 unless tracking is enabled |
-| `live_allocations` | Allocations not yet released |
-| `live_requested_bytes`, `peak_requested_bytes` | Sum of live requested sizes, and its maximum; 0 unless tracking is enabled |
-| `live_usable_bytes`, `peak_usable_bytes` | Sum of live usable sizes, and its maximum |
-| `live_consumed_bytes`, `peak_consumed_bytes` | Arena bytes consumed by live allocations, and its maximum |
-| `free_bytes` | `capacity_bytes - live_consumed_bytes` (not necessarily contiguous) |
-| `largest_free_block` | Any request with `bytes <= largest_free_block` and alignment <= 16 succeeds now |
-| `allocation_count`, `deallocation_count` | Successful allocations; deallocations of non-null pointers |
-| `failed_allocation_count` | `allocate`/`try_allocate` calls that returned no memory |
-| `split_count`, `merge_count` | Block divisions and coalescings performed by the allocator |
-| `requested_bytes_tracked` | Whether the requested-byte fields are meaningful |
+`PoolStats` also reports `span_count`, `span_bytes`, `thread_heap_count`,
+`pending_remote_frees`, `oversized_live_allocations`/`bytes`, peaks of
+requested, usable and consumed bytes, `free_bytes`, `largest_free_block`
+(for the calling thread), and counts of allocations, local and remote
+deallocations, oversized allocations, failures, splits and merges.
 
-All values are exact. Peaks are tracked independently and may have been
-reached at different moments.
+Every counter is updated by the thread that owns it (no shared atomic
+counter on the allocation path) and read with relaxed atomic loads. Values
+are exact when no other thread uses the pool during `stats()`; under
+concurrent use each value is recent but fields may come from slightly
+different moments. Peaks are the sum of per-thread peaks: exact for one
+thread, an upper bound otherwise.
 
-**Requested-byte tracking** is optional. Because `deallocate()` receives no
-size, exact requested-byte statistics need a side table with one byte per
-16-byte granule of the arena (reported as `tracking_bytes`) and one table
-access per allocation and deallocation. Enable it with
-`PoolConfig::track_requested_bytes = true`.
+## Performance
 
-## Implementation
+Two benchmark programs use only the public API:
 
-The allocator is a binary buddy system; its code is in `src/` and is not part
-of the public interface.
+- `nanoalloc_bench`: nine deterministic single-thread traces (small, medium
+  and mixed objects, LIFO, random, bursts, long- and short-lived objects,
+  fragmentation, reuse) against the system allocator, reporting
+  allocation/deallocation throughput and memory (usable, consumed and
+  reserved bytes, slack, metadata). `--help` lists options.
+- `nanoalloc_mtbench`: 1-16 threads with 0-100% cross-thread frees, and a
+  many-to-one inbox scenario with explicit draining.
 
-- **Blocks.** The arena is divided into 16-byte granules. A block of order k
-  is 16 * 2^k bytes and starts at a granule index that is a multiple of 2^k,
-  so blocks are naturally aligned (the arena itself is 4096-aligned). A
-  request is served from the smallest order that holds
-  `max(bytes, alignment, 16)`; a larger free block is split in halves as
-  needed.
-- **Release.** A released block is merged with its buddy whenever the buddy
-  is free, repeatedly, up to the largest possible block.
-- **Free lists.** One doubly linked list per order, with the links stored
-  inside the free blocks.
-- **Metadata.** Blocks carry no header. A free bit per node at every order and
-  a split bit per internal node record the block structure; the block size of
-  a pointer is recovered from them on release. Together they cost about
-  3 bits per 16-byte granule (about 2.3% of the arena), allocated once at
-  construction.
-- **Arena sizes that are not a power of two** are handled as a set of
-  power-of-two root blocks (one per set bit of the granule count). Roots do
-  not merge with each other, so `largest_free_block` is bounded by the largest
-  root.
-- **Sanitizer support.** Under AddressSanitizer, free blocks are poisoned, so
-  ASan reports use-after-free and overflows into free memory inside the arena.
+```bash
+./build/release/benchmarks/nanoalloc_bench
+./build/release/benchmarks/nanoalloc_mtbench
+```
 
-Characteristics that follow from this design:
+Measured on a 4-vCPU Intel Xeon (Cascade Lake) virtual machine with GCC 13.3
+`-O3`, against glibc 2.39 and the previous buddy allocator; full tables,
+method and the optimization history are in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md):
 
-- The usable size of an allocation is the smallest power of two that is at
-  least `max(bytes, alignment, 16)`.
-- Allocation splits at most one block per level; deallocation inspects one
-  bitmap bit per level of the released block and merges at most once per
-  level. The number of levels is log2(capacity / 16).
-- Memory outside the arena is limited to the metadata above (and the
-  requested-size table when enabled).
+| Workload | combined Mops/s glibc | buddy (0.1) | nanoalloc | slack B/alloc glibc | buddy | nanoalloc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| small | 67.4 | 49.0 | 64.8 | 7.5 | 18.2 | 7.5 |
+| medium | 25.3 | 14.4 | 29.6 | 8.5 | 396.8 | 7.5 |
+| mixed | 35.1 | 26.8 | 43.4 | 8.1 | 261.0 | 7.5 |
+| lifo | 14.4 | 14.0 | 29.6 | 7.5 | 83.5 | 7.5 |
+| random | 27.9 | 20.2 | 37.0 | 8.1 | 144.7 | 7.5 |
+| bursts | 51.7 | 33.9 | 66.8 | 7.6 | 29.5 | 7.5 |
+| long_short | 61.2 | 27.3 | 36.3 | 7.6 | 55.4 | 7.5 |
+| fragmentation | 29.7 | 22.9 | 42.5 | 7.7 | 43.8 | 7.5 |
+| reuse | 117.1 | 56.9 | 49.9 | 7.1 | 16.0 | 7.5 |
+
+With four threads, aggregate combined throughput was 73 vs 47 Mops/s
+(glibc) without cross-thread frees and 39 vs 9 Mops/s with 50% of blocks
+freed by another thread. These results come from one virtual machine and a
+specific set of workloads; glibc is faster on workloads that repeatedly
+allocate and free the same sizes (`reuse`, `long_short`), where it reuses
+cached chunks while nanoalloc splits and merges blocks every time.
 
 ## Testing
 
-`ctest` runs four groups of tests, all without external dependencies:
+`ctest` runs, without external dependencies:
 
 | Group | Label | Contents |
 | --- | --- | --- |
-| Public contract | `contract` | `test_pool`, `test_stress`, `test_pmr`, `test_allocator`, `test_no_heap`: alignment (1-4096), boundary sizes (15/16/17, 31/32/33, ... up to 64 KiB + 1), zero-byte and null cases, read/write of the whole usable range, non-overlap, content integrity under unrelated activity, exhaustion and full recovery, large and mixed objects, statistics against an independent model, pmr and Allocator integration with standard containers and non-trivial element types, and a check (via counting replacements of global `operator new`) that no Pool operation allocates after construction |
-| Stress | `stress` | Deterministic randomized runs with reproducible seeds (8 scenarios x 4 seeds). Every live allocation is pattern-filled across its usable range and verified throughout the run, not only at the end, together with non-overlap, statistics and `verify_integrity()`. Set `NANOALLOC_STRESS_SEED` and `NANOALLOC_STRESS_SCALE` to reproduce or extend a run |
-| Implementation | `engine` | `test_buddy`: power-of-two rounding, recursive splitting, buddy identification, merging of valid pairs only, multilevel coalescing, recovery of the original block, free-list and bitmap consistency, non-power-of-two arenas, metadata size |
-| Misuse | `misuse` | Double free, foreign, interior and misaligned pointers must end in nanoalloc's diagnostic; with ASan, use-after-free and overflow into a free block must be reported by ASan |
+| Public contract | `contract` | alignment (1-4096), boundary sizes, zero-byte and null cases, read/write of the whole usable range, non-overlap, content integrity, exhaustion and recovery, large and oversized objects, statistics against a model, pmr and Allocator with standard containers, no system allocation during operations (`test_no_heap`) |
+| Stress | `stress` | deterministic randomized runs (8 scenarios x 4 seeds) verifying data patterns, non-overlap, statistics and `verify_integrity()` throughout; `NANOALLOC_STRESS_SEED`/`NANOALLOC_STRESS_SCALE` reproduce or extend a run |
+| Threads | `threads` | cross-thread frees, many threads freeing into one owner, explicit and implicit draining, concurrent frees while the owner allocates and drains, all-to-all exchange, thread exit with and without live blocks, span reuse after thread exit, concurrent statistics |
+| Engine | `engine` | exact 16-byte rounding, header accounting, bucket layout, splitting at every small remainder, 16-byte fragments, immediate and multilevel coalescing, bitmap transitions, coarse-bucket search, span acquisition and boundaries, oversized allocations, several pools per thread, randomized fragmentation with full validation |
+| Misuse | `misuse` | double frees, foreign, misaligned and interior pointers, other pool, free after the owner exited; under ASan, use-after-free and overflow into free memory |
 
-The contract and stress tests use only the public API and do not depend on
-implementation details such as power-of-two block sizes. The implementation
-tests exercise the internal buddy allocator directly. The examples run as
-tests too, and the benchmark has a short smoke test.
-
-## Benchmarking
-
-`nanoalloc_bench` replays nine deterministic allocation traces against
-`nanoalloc::Pool` and against the system allocator (`malloc`/`free`), and
-reports runtime and memory side by side. It uses only the public API.
-
-```bash
-./build/release/benchmarks/nanoalloc_bench                 # full run
-./build/release/benchmarks/nanoalloc_bench --quick         # short run
-./build/release/benchmarks/nanoalloc_bench --workload small,medium --iterations 15
-./build/release/benchmarks/nanoalloc_bench --csv results.csv --verbose
-./build/release/benchmarks/nanoalloc_bench --list          # workload descriptions
-./build/release/benchmarks/nanoalloc_bench --help
-```
-
-Use a Release build; the tool prints a warning when it was built without
-optimization or with sanitizers.
-
-| Workload | Pattern |
-| --- | --- |
-| `small` | 16-128 B objects, 20k live, random replacement in batches |
-| `medium` | 128-4096 B objects, 4k live, random replacement in batches |
-| `mixed` | 80% 16-256 B, 18% 256 B-4 KiB, 2% 4-64 KiB, random replacement |
-| `lifo` | 50k objects allocated in sequence, freed in reverse order |
-| `random` | random allocation and deallocation batches with random victims |
-| `bursts` | bursts of short-lived small objects freed in FIFO order |
-| `long_short` | short-lived batches interleaved with long-lived objects |
-| `fragmentation` | fill with small objects, free every other one, add larger objects, refill the holes |
-| `reuse` | batches of similarly sized (40-56 B) objects allocated and freed repeatedly |
-
-Method:
-
-- Traces are generated from a fixed seed **before** timing starts, so random
-  number generation is never measured, and all allocators replay the
-  identical operation sequence through the same code.
-- Every allocation writes its first 8 bytes and its last byte; every
-  deallocation reads them back into a checksum that is printed. The work
-  cannot be optimized away and every block is really touched.
-- Traces are split into segments that contain only allocations or only
-  deallocations, and each segment is timed with one `steady_clock` read, so
-  allocation and deallocation throughput are reported separately without
-  per-operation timer overhead.
-- Each workload runs 1 warmup and 9 measured iterations per allocator by
-  default; medians are reported, with the median absolute deviation as a
-  noise estimate. Allocators alternate order between iterations. The pool is
-  reused across iterations so that both allocators run on warm memory.
-- Memory metrics come from a separate untimed replay: peak usable bytes
-  (`usable_size` / `malloc_usable_size`), payload slack per allocation, peak
-  consumed arena bytes, arena utilization and metadata.
-- The arena is sized per workload to at least twice the trace's peak live
-  requested bytes and doubled until an untimed replay succeeds, so a small
-  arena can never make nanoalloc fail where `malloc` succeeds. Any failure
-  during a timed run aborts the benchmark.
-- Allocators: `system` (`malloc`/`free`), `nanoalloc` (default `PoolConfig`)
-  and `nanoalloc-tracked` (`track_requested_bytes = true`).
-
-The report ends with a definition of every column. Results depend on the
-hardware, compiler and system allocator, so measure on the machine you care
-about.
+Contract, stress and thread tests use only the public API. Run the
+`sanitize` (ASan + UBSan) and `tsan` presets to check memory and thread
+safety; under TSan `test_no_heap` is not built because it replaces the global
+`operator new`, which the TSan runtime also defines.
 
 ## Limitations
 
-- **Power-of-two rounding.** The usable size of an allocation is rounded up to
-  a power of two, so an allocation can use up to about twice the requested
-  memory. Large alignments are served by blocks at least as large as the
-  alignment (a 16-byte request with 4096-byte alignment uses a 4096-byte
-  block).
-- **Single-threaded.** A pool has no internal synchronization.
-- **Fixed capacity.** The arena does not grow; exhaustion is an error by
-  design. Memory is not returned to the operating system while the pool
-  lives.
-- **Largest allocation** is the largest power-of-two root of the arena (for a
-  3 MiB arena, 2 MiB).
+- **Memory retention per thread.** A thread keeps the spans it acquired until
+  it exits, even when they are empty, so reserved memory grows with the number
+  of threads (about one or more 1 MiB spans per thread). Memory is never
+  returned to the operating system while the pool lives.
+- **Thread lifetime contract** (see [Threads](#threads)): blocks of a thread
+  must not be freed by others after it begins to exit.
+- **Remote frees are deferred**: a block freed by another thread is reused
+  only after its owner allocates, frees or drains.
+- **16-byte header** per allocation: for very small objects the header can
+  exceed the rounding savings.
+- **Fixed budget**: the pool does not grow beyond `capacity_bytes`. A pool
+  smaller than 1 MiB carves spans smaller than 1 MiB, which limits the
+  largest span allocation, and each thread's first allocation takes about
+  3.4 KiB of the budget for its heap.
 - **Alignment** above 4096 bytes is not supported.
-- **Requested-byte statistics** are opt-in (see
-  [Memory accounting](#memory-accounting)).
 
 ## Project layout
 
 ```
-include/nanoalloc/   public headers (pool, memory_resource, allocator, version, config)
-src/                 Pool implementation and the internal buddy allocator
-tests/               contract, stress, implementation and misuse tests (CTest)
-benchmarks/          nanoalloc_bench: workloads, runner and reporting
-examples/            runnable usage examples (also run by CTest)
-cmake/               build helpers and package configuration
+include/nanoalloc/   public headers
+src/                 pool, thread heaps (heap.*), block format (block.hpp)
+tests/               contract, stress, thread, engine and misuse tests
+benchmarks/          nanoalloc_bench, nanoalloc_mtbench
+examples/            runnable usage examples
+docs/                performance log
 ```
 
 ## License

@@ -27,6 +27,7 @@ jobs:
           - { compiler: clang, cxx: clang++, build_type: Release, sanitize: "" }
           - { compiler: gcc, cxx: g++, build_type: Debug, sanitize: "address;undefined" }
           - { compiler: clang, cxx: clang++, build_type: Debug, sanitize: "address;undefined" }
+          - { compiler: clang, cxx: clang++, build_type: Debug, sanitize: "thread" }
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
@@ -44,10 +45,13 @@ jobs:
       - name: Test
         env:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: ctest --test-dir build --output-on-failure --parallel 4
       - name: Benchmark (quick)
         if: matrix.build_type == 'Release' && matrix.sanitize == ''
-        run: ./build/benchmarks/nanoalloc_bench --quick
+        run: |
+          ./build/benchmarks/nanoalloc_bench --quick
+          ./build/benchmarks/nanoalloc_mtbench --quick
 
   linux-shared:
     name: Linux shared library + install
@@ -91,4 +95,6 @@ jobs:
         run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --parallel 4
       - name: Benchmark (quick)
         if: matrix.config == 'Release'
-        run: .\build\benchmarks\Release\nanoalloc_bench.exe --quick
+        run: |
+          .\build\benchmarks\Release\nanoalloc_bench.exe --quick
+          .\build\benchmarks\Release\nanoalloc_mtbench.exe --quick

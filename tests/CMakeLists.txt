@@ -50,6 +50,7 @@ set(NANOALLOC_MISUSE_SCENARIOS
     "double_free\;double free"
     "double_free_unmerged\;double free"
     "foreign_pointer\;not allocated by this pool"
+    "pool_address_before_pointer\;not allocated by this pool"
     "other_pool\;not allocated by this pool"
     "interior_pointer\;does not refer to the start of an allocated block"
     "misaligned_pointer\;not allocated by this pool"

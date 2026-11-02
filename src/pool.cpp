@@ -68,6 +68,28 @@ constexpr bool is_power_of_two(std::size_t value) noexcept {
 
 constexpr std::size_t kHeapObjectSize = round_up(sizeof(ThreadHeap), 64);
 
+// Oversized blocks carry the same 16-byte header as span blocks:
+//   word0 = (pool address | log2(alignment) << 2 | EXTERNAL) ^ kExternalTag
+//   word1 = magic | payload size | slack
+// The tag sets high address bits, so a stray copy of the pool's address in
+// front of a foreign pointer is not mistaken for an oversized block header.
+constexpr std::uint64_t kExternalTag = 0xA55A'0000'0000'0000ULL;
+constexpr std::uint64_t kExternalSizeMask = 0x0000'FFFF'FFFF'FFF0ULL;
+
+[[nodiscard]] bool is_external_of(std::uint64_t word0, std::uint64_t word1,
+                                  const void* pool) noexcept {
+    return ((word0 ^ kExternalTag) & detail::kOwnerMask) == detail::address_of(pool) &&
+           (word1 & detail::kMagicMask) == detail::kMagic;
+}
+
+[[nodiscard]] std::size_t external_alignment(std::uint64_t word0) noexcept {
+    return std::size_t{1} << (((word0 ^ kExternalTag) >> detail::kAlignShiftPos) & 15U);
+}
+
+[[nodiscard]] std::size_t external_payload(std::uint64_t word1) noexcept {
+    return static_cast<std::size_t>(word1 & kExternalSizeMask);
+}
+
 // ---- thread-local lookup -------------------------------------------------------
 // A small direct-mapped cache from pool id to the calling thread's heap. It is
 // trivially constructible, so accessing it needs no initialization guard.
@@ -348,9 +370,7 @@ PoolCore::~PoolCore() {
     for (ExternalLinks* node = external_; node != nullptr;) {
         ExternalLinks* next = node->next;
         Block* header = reinterpret_cast<Block*>(node + 1);
-        const std::uint64_t word0 = detail::load_word(header->word0);
-        const std::size_t alignment = std::size_t{1}
-                                      << ((word0 >> detail::kAlignShiftPos) & 15U);
+        const std::size_t alignment = external_alignment(detail::load_word(header->word0));
         const std::size_t front = std::max<std::size_t>(alignment, 32);
         ::operator delete(reinterpret_cast<std::byte*>(node + 1) + kHeaderSize - front,
                           std::align_val_t{alignment});
@@ -488,7 +508,7 @@ void PoolCore::deallocate_remote(ThreadHeap* owner, ThreadHeap* self, Block* blo
 void* PoolCore::allocate_external(std::size_t bytes, std::size_t alignment) noexcept {
     const std::size_t align = std::max(alignment, detail::kGranule);
     const std::size_t front = std::max<std::size_t>(align, 32);
-    if (bytes > capacity_) {
+    if (bytes > capacity_ || bytes >= kExternalSizeMask) {
         failed_.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
@@ -508,10 +528,11 @@ void* PoolCore::allocate_external(std::size_t bytes, std::size_t alignment) noex
     auto* node = reinterpret_cast<ExternalLinks*>(user - kHeaderSize - sizeof(ExternalLinks));
     Block* header = detail::header_of(user);
     const auto log2_align = static_cast<std::uint64_t>(std::countr_zero(align));
-    detail::store_word(header->word0, detail::address_of(this) |
-                                          (log2_align << detail::kAlignShiftPos) |
-                                          detail::kStateExternal);
-    detail::store_word(header->word1, static_cast<std::uint64_t>(payload) |
+    detail::store_word(header->word0, (detail::address_of(this) |
+                                       (log2_align << detail::kAlignShiftPos) |
+                                       detail::kStateExternal) ^
+                                          kExternalTag);
+    detail::store_word(header->word1, detail::kMagic | static_cast<std::uint64_t>(payload) |
                                           static_cast<std::uint64_t>(payload - bytes));
     node->prev = nullptr;
     node->next = external_;
@@ -532,13 +553,13 @@ void* PoolCore::allocate_external(std::size_t bytes, std::size_t alignment) noex
 }
 
 void PoolCore::deallocate_external(Block* block, std::uint64_t word0, const void* ptr) noexcept {
-    if ((word0 & detail::kOwnerMask) != detail::address_of(this)) {
+    const std::uint64_t word1 = detail::load_word(block->word1);
+    if (!is_external_of(word0, word1, this)) {
         bad_pointer(ptr);
     }
-    const std::size_t align = std::size_t{1} << ((word0 >> detail::kAlignShiftPos) & 15U);
+    const std::size_t align = external_alignment(word0);
     const std::size_t front = std::max<std::size_t>(align, 32);
-    const std::uint64_t word1 = detail::load_word(block->word1);
-    const std::size_t payload = static_cast<std::size_t>(word1 & ~detail::kSlackMask);
+    const std::size_t payload = external_payload(word1);
     auto* node = reinterpret_cast<ExternalLinks*>(block) - 1;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -579,10 +600,11 @@ std::size_t PoolCore::usable_size(const void* ptr) const noexcept {
         return detail::size_field(word1) - kHeaderSize;
     }
     if (state == detail::kStateExternal) {
-        if ((word0 & detail::kOwnerMask) != detail::address_of(this)) {
+        const std::uint64_t word1 = detail::load_word(block->word1);
+        if (!is_external_of(word0, word1, this)) {
             bad_pointer(ptr);
         }
-        return static_cast<std::size_t>(detail::load_word(block->word1) & ~detail::kSlackMask);
+        return external_payload(word1);
     }
     if ((detail::load_word(block->word1) & detail::kMagicMask) != detail::kMagic) {
         bad_pointer(ptr);
@@ -601,7 +623,7 @@ bool PoolCore::owns(const void* ptr) const noexcept {
         const std::uintptr_t payload = detail::address_of(header + 1);
         const std::uint64_t word1 =
             detail::load_word(const_cast<std::uint64_t&>(header->word1));
-        if (address >= payload && address - payload < (word1 & ~detail::kSlackMask)) {
+        if (address >= payload && address - payload < external_payload(word1)) {
             return true;
         }
     }

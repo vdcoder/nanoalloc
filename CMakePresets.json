@@ -1,6 +1,10 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "base",
@@ -15,14 +19,18 @@
       "displayName": "Debug",
       "inherits": "base",
       "generator": "Ninja",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
     },
     {
       "name": "release",
       "displayName": "Release (use for benchmarks)",
       "inherits": "base",
       "generator": "Ninja",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     },
     {
       "name": "sanitize",
@@ -33,7 +41,27 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "NANOALLOC_SANITIZE": "address;undefined"
       },
-      "condition": { "type": "notEquals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "Debug + ThreadSanitizer (Clang)",
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "NANOALLOC_SANITIZE": "thread"
+      },
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "msvc",
@@ -41,32 +69,75 @@
       "inherits": "base",
       "generator": "Visual Studio 17 2022",
       "architecture": "x64",
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "msvc-asan",
       "displayName": "Visual Studio 2022 + AddressSanitizer",
       "inherits": "msvc",
-      "cacheVariables": { "NANOALLOC_SANITIZE": "address" }
+      "cacheVariables": {
+        "NANOALLOC_SANITIZE": "address"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" },
-    { "name": "sanitize", "configurePreset": "sanitize" },
-    { "name": "msvc-debug", "configurePreset": "msvc", "configuration": "Debug" },
-    { "name": "msvc-release", "configurePreset": "msvc", "configuration": "Release" },
-    { "name": "msvc-asan", "configurePreset": "msvc-asan", "configuration": "Debug" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "sanitize",
+      "configurePreset": "sanitize"
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
+      "name": "msvc-debug",
+      "configurePreset": "msvc",
+      "configuration": "Debug"
+    },
+    {
+      "name": "msvc-release",
+      "configurePreset": "msvc",
+      "configuration": "Release"
+    },
+    {
+      "name": "msvc-asan",
+      "configurePreset": "msvc-asan",
+      "configuration": "Debug"
+    }
   ],
   "testPresets": [
     {
       "name": "base",
       "hidden": true,
-      "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error" }
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
     },
-    { "name": "debug", "inherits": "base", "configurePreset": "debug" },
-    { "name": "release", "inherits": "base", "configurePreset": "release" },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "configurePreset": "release"
+    },
     {
       "name": "sanitize",
       "inherits": "base",
@@ -76,8 +147,31 @@
         "UBSAN_OPTIONS": "print_stacktrace=1:halt_on_error=1"
       }
     },
-    { "name": "msvc-debug", "inherits": "base", "configurePreset": "msvc", "configuration": "Debug" },
-    { "name": "msvc-release", "inherits": "base", "configurePreset": "msvc", "configuration": "Release" },
-    { "name": "msvc-asan", "inherits": "base", "configurePreset": "msvc-asan", "configuration": "Debug" }
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "configurePreset": "tsan",
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1"
+      }
+    },
+    {
+      "name": "msvc-debug",
+      "inherits": "base",
+      "configurePreset": "msvc",
+      "configuration": "Debug"
+    },
+    {
+      "name": "msvc-release",
+      "inherits": "base",
+      "configurePreset": "msvc",
+      "configuration": "Release"
+    },
+    {
+      "name": "msvc-asan",
+      "inherits": "base",
+      "configurePreset": "msvc-asan",
+      "configuration": "Debug"
+    }
   ]
 }

@@ -335,6 +335,7 @@ struct MemoryResult {
     std::uint64_t total_usable = 0;  // sum of usable sizes over all allocations
     std::uint64_t max_slack = 0;     // largest usable - requested of any allocation
     std::uint64_t capacity = 0;
+    std::uint64_t reserved = 0;  // pool memory reserved at the end of the replay
     std::uint64_t metadata = 0;
     std::uint64_t tracking = 0;
     std::uint64_t splits = 0;
@@ -374,6 +375,7 @@ bool measure_pool(const Trace& trace, const nanoalloc::PoolConfig& config, Memor
     result.peak_usable = stats.peak_usable_bytes;
     result.peak_consumed = stats.peak_consumed_bytes;
     result.capacity = stats.capacity_bytes;
+    result.reserved = stats.reserved_bytes;
     result.metadata = stats.metadata_bytes;
     result.tracking = stats.tracking_bytes;
     result.splits = stats.split_count;
@@ -542,11 +544,11 @@ void print_runtime_table(const std::vector<Result>& results) {
 
 void print_memory_table(const std::vector<Result>& results) {
     std::printf("Memory (untimed replay of the same trace)\n");
-    std::printf("%-14s %-17s %9s %9s %9s %8s %7s %8s %9s %7s %9s %6s\n", "workload", "allocator",
-                "peak req", "peak use", "peak con", "slack", "slack", "max", "arena", "arena",
-                "metadata", "meta");
-    std::printf("%-14s %-17s %9s %9s %9s %8s %7s %8s %9s %7s %9s %6s\n", "", "", "MiB", "MiB",
-                "MiB", "B/alloc", "%", "slack B", "MiB", "util %", "KiB", "%");
+    std::printf("%-14s %-17s %9s %9s %9s %8s %7s %8s %9s %7s %9s %9s %6s\n", "workload",
+                "allocator", "peak req", "peak use", "peak con", "slack", "slack", "max", "arena",
+                "arena", "reserved", "metadata", "meta");
+    std::printf("%-14s %-17s %9s %9s %9s %8s %7s %8s %9s %7s %9s %9s %6s\n", "", "", "MiB",
+                "MiB", "MiB", "B/alloc", "%", "slack B", "MiB", "util %", "MiB", "KiB", "%");
     std::string previous;
     for (const Result& r : results) {
         const bool first = r.workload != previous;
@@ -560,6 +562,7 @@ void print_memory_table(const std::vector<Result>& results) {
         char max_slack[16] = "n/a";
         char arena[16] = "-";
         char util[16] = "-";
+        char reserved[16] = "-";
         char meta[16] = "-";
         char meta_pct[16] = "-";
         if (m.usable_known) {
@@ -576,6 +579,8 @@ void print_memory_table(const std::vector<Result>& results) {
         }
         if (m.arena_known) {
             std::snprintf(arena, sizeof(arena), "%.0f", static_cast<double>(m.capacity) / kMiB);
+            std::snprintf(reserved, sizeof(reserved), "%.2f",
+                          static_cast<double>(m.reserved) / kMiB);
             std::snprintf(util, sizeof(util), "%.1f",
                           100.0 * static_cast<double>(m.peak_consumed) /
                               static_cast<double>(m.capacity));
@@ -585,10 +590,10 @@ void print_memory_table(const std::vector<Result>& results) {
                           100.0 * static_cast<double>(bookkeeping) /
                               static_cast<double>(m.capacity));
         }
-        std::printf("%-14s %-17s %9.2f %9s %9s %8s %7s %8s %9s %7s %9s %6s\n",
+        std::printf("%-14s %-17s %9.2f %9s %9s %8s %7s %8s %9s %7s %9s %9s %6s\n",
                     first ? r.workload.c_str() : "", r.allocator.c_str(),
                     static_cast<double>(r.peak_requested) / kMiB, usable, consumed, slack_alloc,
-                    slack_pct, max_slack, arena, util, meta, meta_pct);
+                    slack_pct, max_slack, arena, util, reserved, meta, meta_pct);
     }
     std::printf("\n");
 }
@@ -609,6 +614,8 @@ void print_definitions() {
         "  slack              usable - requested, averaged over all allocations (B/alloc) and\n"
         "                     relative to all requested bytes (%%); max = worst single allocation\n"
         "  arena / util       nanoalloc arena capacity / peak consumed as a share of it\n"
+        "  reserved           nanoalloc memory reserved from its arena (and the system, for\n"
+        "                     oversized blocks) at the end of the replay\n"
         "  metadata           nanoalloc bookkeeping outside the arena (engine metadata plus the\n"
         "                     requested-size table when tracking is enabled), and its share of\n"
         "                     the arena\n"
@@ -625,7 +632,7 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
     out << "workload,allocator,allocations,deallocations,alloc_ns_median,free_ns_median,"
            "total_ns_median,alloc_mops,free_mops,combined_mops,noise,peak_requested,"
            "peak_usable,peak_consumed,total_requested,total_usable,max_slack,capacity,"
-           "metadata,tracking,splits,merges,compiler,build_type,cpu\n";
+           "metadata,tracking,splits,merges,reserved,compiler,build_type,cpu\n";
     for (const Result& r : results) {
         const MemoryResult& m = r.memory;
         out << r.workload << ',' << r.allocator << ',' << r.allocations << ',' << r.deallocations
@@ -643,7 +650,8 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
             << (m.arena_known ? std::to_string(m.metadata) : "") << ','
             << (m.arena_known ? std::to_string(m.tracking) : "") << ','
             << (m.arena_known ? std::to_string(m.splits) : "") << ','
-            << (m.arena_known ? std::to_string(m.merges) : "") << ",\"" << platform.compiler
+            << (m.arena_known ? std::to_string(m.merges) : "") << ','
+            << (m.arena_known ? std::to_string(m.reserved) : "") << ",\"" << platform.compiler
             << "\"," << platform.build_type << ",\"" << platform.cpu << "\"\n";
     }
 }

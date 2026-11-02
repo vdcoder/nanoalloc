@@ -37,6 +37,13 @@ int run(const char* scenario) {
     } else if (std::strcmp(scenario, "foreign_pointer") == 0) {
         int local = 0;
         pool.deallocate(&local);
+    } else if (std::strcmp(scenario, "pool_address_before_pointer") == 0) {
+        // The 16 bytes in front of the pointer hold a copy of the Pool object
+        // (its implementation pointer), which must not pass for a header.
+        alignas(16) unsigned char buffer[64] = {};
+        static_assert(sizeof(pool) <= 16);
+        std::memcpy(buffer, &pool, sizeof(pool));
+        pool.deallocate(buffer + 16);
     } else if (std::strcmp(scenario, "other_pool") == 0) {
         nanoalloc::Pool other({64 * 1024});
         void* ptr = other.allocate(32);
