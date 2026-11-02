@@ -266,6 +266,13 @@ private:
     [[nodiscard]] unsigned find_nonempty(unsigned start) const noexcept;
 
     void push_free(Block* block, unsigned bucket) noexcept;
+    // Branch-free variants for the split path, where whether a list is or
+    // runs empty is data-dependent and poorly predicted.
+    void push_free_branchless(Block* block, unsigned bucket) noexcept;
+    void pop_head_branchless(Block* head, unsigned bucket) noexcept;
+    /// Stands in for the previous head when push_free_branchless() pushes
+    /// onto an empty list.
+    Block* scratch_node() noexcept { return reinterpret_cast<Block*>(scratch_); }
     void unlink_free(Block* block, unsigned bucket) noexcept;
     [[nodiscard]] Fit find_fit(std::size_t need) const noexcept;
 
@@ -317,6 +324,7 @@ private:
     std::uint64_t nonempty_[kBitmapWords] = {};
     HeapCounters counters_;
     Block* heads_[kBucketCount] = {};
+    alignas(16) unsigned char scratch_[kMinFreeBlock] = {};
 };
 
 // =============================================================================
@@ -350,6 +358,26 @@ inline void ThreadHeap::push_free(Block* block, unsigned bucket) noexcept {
         mark_nonempty(bucket);
     }
     heads_[bucket] = block;
+}
+
+inline void ThreadHeap::push_free_branchless(Block* block, unsigned bucket) noexcept {
+    Block* head = heads_[bucket];
+    set_link_next(block, head);
+    // An empty list's back link goes to the scratch node; setting the bitmap
+    // bit of a non-empty bucket again is harmless.
+    set_link_prev(head != nullptr ? head : scratch_node(), block);
+    mark_nonempty(bucket);
+    heads_[bucket] = block;
+}
+
+inline void ThreadHeap::pop_head_branchless(Block* head, unsigned bucket) noexcept {
+    Block* next = link_next(head);
+    heads_[bucket] = next;
+    const unsigned word = bucket >> 6;
+    const std::uint64_t bits =
+        nonempty_[word] & ~(std::uint64_t{next == nullptr} << (bucket & 63U));
+    nonempty_[word] = bits;
+    summary_ &= ~(std::uint64_t{bits == 0} << word);
 }
 
 // The head's `prev` link is not maintained: heads_[] identifies the head, so

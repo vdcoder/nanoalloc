@@ -337,7 +337,10 @@ NANO_TEST(allocator_container_built_by_one_thread_and_destroyed_by_another) {
     while (phase.load() != 1) {
         std::this_thread::yield();
     }
-    bool intact = built->size() == 2000;
+    // Every node, and any bookkeeping node the standard library allocates
+    // through the allocator (MSVC's std::map has one), came from the builder.
+    const std::uint64_t built_blocks = pool.stats().allocation_count;
+    bool intact = built->size() == 2000 && built_blocks >= 2000;
     for (const auto& [key, value] : *built) {
         intact = intact && value == static_cast<std::uint64_t>(key) * 3;
     }
@@ -348,7 +351,7 @@ NANO_TEST(allocator_container_built_by_one_thread_and_destroyed_by_another) {
     const nanoalloc::PoolStats stats = pool.stats();
     CHECK_EQ(stats.live_allocations, 0U);
     CHECK_EQ(stats.pending_remote_frees, 0U);
-    CHECK_EQ(stats.remote_deallocation_count, 2000U);
+    CHECK_EQ(stats.remote_deallocation_count, built_blocks);
     CHECK(pool.verify_integrity());
 }
 

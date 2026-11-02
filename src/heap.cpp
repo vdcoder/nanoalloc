@@ -17,8 +17,9 @@ void* ThreadHeap::allocate_split(std::size_t requested,
             counters_.failed.add(1);
             if constexpr (Policy == OnFailure::kThrow) {
                 throw_bad_alloc();
+            } else {
+                return nullptr;
             }
-            return nullptr;
         }
         fit = find_fit(need);
     }
@@ -75,13 +76,9 @@ void* ThreadHeap::allocate_larger(std::size_t requested, std::size_t payload,
     if (rest < kBucketBounds.min[found]) {
         // The remainder leaves this bucket: pop the head, then file the
         // remainder under its own size (or keep it as a 16-byte fragment).
-        Block* next = link_next(free_block);
-        heads_[found] = next;
-        if (next == nullptr) {
-            mark_empty(found);
-        }
+        pop_head_branchless(free_block, found);
         if (rest >= kMinFreeBlock) {
-            push_free(free_block, bucket_index(rest));
+            push_free_branchless(free_block, bucket_index(rest));
         } else {
             counters_.fragment_bytes.add(kHeaderSize);
         }
