@@ -6,6 +6,7 @@
 #include <nanoalloc/allocator.hpp>
 #include <nanoalloc/pool.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -15,6 +16,7 @@
 #include <new>
 #include <set>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -312,6 +314,42 @@ NANO_TEST(allocator_propagation_semantics) {
     CHECK(first_pool.owns(target.data()));
     CHECK_EQ(a.size(), 4U);
     CHECK_EQ(target.size(), 3U);
+}
+
+NANO_TEST(allocator_container_built_by_one_thread_and_destroyed_by_another) {
+    // Within the thread lifetime contract: the building thread stays alive
+    // until the other thread has destroyed the container.
+    Pool pool({16 * kMiB});
+    using Map = std::map<int, std::uint64_t, std::less<>,
+                         Allocator<std::pair<const int, std::uint64_t>>>;
+    std::atomic<int> phase{0};
+    Map* built = nullptr;
+    std::thread builder([&] {
+        built = new Map(Allocator<std::pair<const int, std::uint64_t>>(pool));
+        for (int i = 0; i < 2000; ++i) {
+            built->emplace(i, static_cast<std::uint64_t>(i) * 3);
+        }
+        phase = 1;
+        while (phase.load() != 2) {
+            std::this_thread::yield();
+        }
+    });
+    while (phase.load() != 1) {
+        std::this_thread::yield();
+    }
+    bool intact = built->size() == 2000;
+    for (const auto& [key, value] : *built) {
+        intact = intact && value == static_cast<std::uint64_t>(key) * 3;
+    }
+    delete built;  // every node is released by this thread, remotely
+    phase = 2;
+    builder.join();
+    CHECK(intact);
+    const nanoalloc::PoolStats stats = pool.stats();
+    CHECK_EQ(stats.live_allocations, 0U);
+    CHECK_EQ(stats.pending_remote_frees, 0U);
+    CHECK_EQ(stats.remote_deallocation_count, 2000U);
+    CHECK(pool.verify_integrity());
 }
 
 NANOTEST_MAIN()

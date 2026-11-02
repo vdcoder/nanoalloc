@@ -17,12 +17,21 @@ struct PoolConfig {
     /// than Pool::max_capacity; it is rounded up to a multiple of
     /// Pool::granularity.
     ///
-    /// The pool reserves an arena of this size at construction (the operating
-    /// system typically commits its pages lazily) and carves 1 MiB spans and
-    /// per-thread bookkeeping from it on demand. Requests too large for a span
-    /// are served by the system allocator and are charged against the same
-    /// budget. The pool never exceeds the budget and never falls back to
-    /// another allocator: exhaustion is reported as an allocation failure.
+    /// The pool allocates an arena of this size from the system at
+    /// construction (most operating systems commit its pages only when they
+    /// are first touched) and carves per-thread heaps and 1 MiB spans from it
+    /// on demand. Requests too large for a span ("oversized") are served by
+    /// separate system allocations.
+    ///
+    /// Everything the pool hands out is charged against the budget: per-thread
+    /// heaps, spans and oversized allocations together never exceed it
+    /// (PoolStats::reserved_bytes <= capacity_bytes), and a request that would
+    /// exceed it fails instead of falling back to another allocator. The
+    /// budget is not a bound on the memory obtained from the system: the arena
+    /// is allocated in full up front and oversized allocations come on top of
+    /// it, so PoolStats::system_reserved_bytes can approach twice the budget
+    /// when oversized allocations use the part of the budget that spans have
+    /// not taken.
     std::size_t capacity_bytes = 0;
 
     /// Report requested-byte statistics. Every block header records its
@@ -42,33 +51,59 @@ struct PoolConfig {
 ///   consumed:  memory made unavailable by a live allocation: usable bytes
 ///              plus the 16-byte block header (span blocks), or the whole
 ///              system allocation (oversized blocks).
-///   reserved:  memory carved from the arena (spans and thread heaps) plus
-///              the system memory of live oversized allocations.
+///   reserved:  charged against the budget (PoolConfig::capacity_bytes).
+///
+/// Every reserved byte is in exactly one place. When no other thread uses the
+/// pool during the call:
+///
+///   reserved_bytes == metadata_bytes + live_consumed_bytes
+///                     + thread_free_bytes + free_span_bytes
+///   reserved_bytes <= capacity_bytes
+///   allocation_count == deallocation_count + live_allocations
+///                       - pending_remote_frees
 ///
 /// Accuracy: every counter is maintained by the thread that owns it and read
 /// with relaxed atomic loads. Values are exact when no other thread is using
 /// the pool during the call; under concurrent use each value is a recent
 /// value, but different fields may come from slightly different moments.
-/// Peak values are the sum of per-thread peaks: exact when one thread uses the
-/// pool, an upper bound of the true combined peak otherwise.
+///
+/// History: counters and peaks cover the whole life of the pool. A per-thread
+/// heap left behind by an exited thread is reused by the next new thread
+/// together with its counters, so no statistic is lost when threads come and
+/// go.
 struct PoolStats {
     // --- Budget and reservation ----------------------------------------------
     /// The pool's memory budget (PoolConfig::capacity_bytes rounded up).
     std::size_t capacity_bytes = 0;
-    /// Bookkeeping memory: the pool object, per-thread heaps, and span headers
-    /// and fences. Excludes the per-allocation headers (header_bytes).
+    /// Budget charged so far: arena bytes carved for per-thread heaps and
+    /// spans, plus the system memory of live oversized allocations. Never
+    /// exceeds capacity_bytes. Carved spans stay charged (owned by a thread or
+    /// kept in the pool's free-span list) until the pool is destroyed.
+    std::size_t reserved_bytes = 0;
+    /// Memory currently obtained from the system for this pool: the whole
+    /// arena (capacity_bytes, allocated at construction), the pool object and
+    /// the system allocations of live oversized blocks. Excludes the system
+    /// allocator's own overhead and does not tell how much is committed.
+    std::size_t system_reserved_bytes = 0;
+    /// Bookkeeping memory carved from the arena: per-thread heap objects and
+    /// the headers and fences of the spans that thread heaps own. Excludes the
+    /// per-allocation headers (header_bytes) and the pool object.
     std::size_t metadata_bytes = 0;
     /// Always 0: requested sizes are recorded in the block headers.
     std::size_t tracking_bytes = 0;
-    /// Arena bytes carved so far (spans and thread heaps) plus the system
-    /// memory of live oversized allocations.
-    std::size_t reserved_bytes = 0;
-    /// Number and total size of spans carved from the arena (owned by thread
-    /// heaps or kept for reuse).
+    /// Number and total size of spans carved from the arena, whether owned by
+    /// a thread heap or kept for reuse.
     std::size_t span_count = 0;
     std::size_t span_bytes = 0;
-    /// Number of per-thread heaps created for this pool.
+    /// Spans that no thread owns: returned, completely free, by exited
+    /// threads. Any thread that needs a span takes one of these before a new
+    /// span is carved.
+    std::size_t free_span_count = 0;
+    std::size_t free_span_bytes = 0;
+    /// Per-thread heaps ever carved for this pool, and those owned by a
+    /// running thread. Heaps of exited threads that hold no memory are reused.
     std::size_t thread_heap_count = 0;
+    std::size_t active_thread_heap_count = 0;
 
     // --- Live usage (current values) ------------------------------------------
     /// Allocations not yet returned to free memory, including blocks released
@@ -84,28 +119,41 @@ struct PoolStats {
     /// Per-allocation overhead of live allocations: 16-byte block headers, and
     /// header plus alignment padding of oversized allocations.
     std::size_t header_bytes = 0;
-    /// Remote deallocations waiting in their owner's inbox.
+    /// Blocks released by other threads that are waiting in their owner's
+    /// inbox: sent and not yet drained, counted by the owning heap.
     std::size_t pending_remote_frees = 0;
     /// Free 16-byte blocks: a header without payload, left between two
     /// allocations when an exact split leaves 16 bytes. They are merged back
-    /// as soon as a neighbouring block is released.
+    /// as soon as a neighbouring block is released. Part of thread_free_bytes.
     std::size_t fragment_bytes = 0;
-    /// Live allocations served by the system allocator because they do not
-    /// fit in a span, and their payload bytes.
+    /// Live allocations served by separate system allocations because they
+    /// do not fit in a span: their number, payload bytes, and system bytes
+    /// (payload, header and alignment padding; charged against the budget).
     std::size_t oversized_live_allocations = 0;
     std::size_t oversized_live_bytes = 0;
+    std::size_t oversized_reserved_bytes = 0;
 
     // --- High-water marks -------------------------------------------------------
-    // Each peak is tracked independently (see Accuracy above).
+    // Each peak is tracked per thread heap, plus one for oversized blocks, and
+    // the reported value is their sum: exact when a single thread allocates
+    // from spans only, otherwise an upper bound of the true combined peak
+    // (heaps may have peaked at different moments). Peaks never decrease.
     std::size_t peak_requested_bytes = 0;
     std::size_t peak_usable_bytes = 0;
     std::size_t peak_consumed_bytes = 0;
 
-    // --- Availability -------------------------------------------------------------
-    /// capacity_bytes - live_consumed_bytes. Not necessarily contiguous, and
-    /// it includes bookkeeping memory and free memory held in other threads'
-    /// spans, which the calling thread cannot use.
+    // --- Free memory ----------------------------------------------------------------
+    /// capacity_bytes - live_consumed_bytes: the part of the budget that live
+    /// allocations do not consume. A utilization figure, not an amount the
+    /// caller can allocate: it includes bookkeeping memory, free memory in
+    /// other threads' spans and fragmentation. Use largest_free_block for a
+    /// guarantee.
     std::size_t free_bytes = 0;
+    /// Bytes of free blocks (headers included) inside spans owned by thread
+    /// heaps. Only the owning thread allocates from them; memory freed into a
+    /// thread's spans is not available to other threads while it runs. Spans
+    /// that become completely free return to the pool when the thread exits.
+    std::size_t thread_free_bytes = 0;
     /// The largest request that the calling thread is guaranteed to be able to
     /// allocate from a span right now (assuming no concurrent use): any
     /// allocate(bytes, alignment) with bytes <= largest_free_block and
@@ -116,12 +164,13 @@ struct PoolStats {
     // --- Event counters since construction -----------------------------------------
     /// Successful allocations (span and oversized).
     std::uint64_t allocation_count = 0;
-    /// deallocate() calls with a non-null pointer (local, remote and
-    /// oversized), counted when the call is made.
+    /// deallocate() calls with a non-null pointer: local, remote and
+    /// oversized, counted when the call is made.
     std::uint64_t deallocation_count = 0;
-    /// Deallocations of blocks owned by the calling thread, and of blocks
-    /// owned by another thread (sent to that thread's inbox).
+    /// Deallocations of span blocks by the thread that allocated them.
     std::uint64_t local_deallocation_count = 0;
+    /// Deallocations of span blocks by another thread (sent to the owner's
+    /// inbox). Counted once, by the receiving heap.
     std::uint64_t remote_deallocation_count = 0;
     /// Oversized allocations made since construction.
     std::uint64_t oversized_allocation_count = 0;
@@ -153,7 +202,8 @@ struct PoolStats {
 ///   * Live allocations never overlap, including their full usable_size().
 ///   * Deallocation does not need the allocation size.
 ///   * Allocation and deallocation never call the system allocator, except
-///     for oversized requests (see PoolConfig::capacity_bytes).
+///     for oversized requests, which are still charged against the budget
+///     (see PoolConfig::capacity_bytes).
 ///   * In single-threaded use, once every allocation has been released and
 ///     drained, free_bytes == capacity_bytes and largest_free_block returns
 ///     to its initial value.
@@ -163,13 +213,27 @@ struct PoolStats {
 /// concurrently from any threads. verify_integrity() requires that no other
 /// thread uses the pool during the call.
 ///
-/// Thread lifetime contract: memory allocated by a thread must not be accessed
-/// or deallocated by another thread after the allocating thread has begun to
-/// terminate. All cross-thread deallocations of its blocks must complete, with
-/// appropriate synchronization (for example, joining the freeing threads),
-/// before it exits. At exit a thread drains its inbox and returns its
-/// completely free spans to the pool for reuse by other threads; spans that
-/// still hold live blocks stay reserved until the pool is destroyed.
+/// Thread lifetime contract: the thread that allocates a block owns it. All
+/// accesses to a block by other threads, including its deallocation, must
+/// complete before its owner begins to terminate; "complete" means ordered by
+/// synchronization the program has anyway, for example joining the threads
+/// that use the block, or having them signal the owner, before the owner's
+/// thread function returns. The owner itself may use its blocks until it has
+/// finished terminating.
+///
+/// When a thread that used the pool terminates (when its thread_local objects
+/// are destroyed), the pool releases the frees pending in its inbox and
+/// returns its completely free spans to the pool for other threads. Then:
+///   * Blocks it still owns stay allocated until the pool is destroyed, and
+///     their spans stay with its heap. Other threads must not access them;
+///     a deallocation by another thread is detected and terminates the
+///     process with a diagnostic.
+///   * thread_local destructors of the terminating thread that run later may
+///     still use the pool: they may free the thread's own blocks (spans that
+///     become free return to the pool) and allocate. These calls take the
+///     pool's lock; memory they leave allocated stays with the thread's heap.
+///   * A per-thread heap that holds no span is reused by the next thread that
+///     uses the pool, with its statistics.
 ///
 /// Lifetime: the Pool must outlive every allocation made from it and every
 /// adapter (MemoryResource, Allocator) and container that refers to it.
@@ -180,8 +244,8 @@ struct PoolStats {
 /// not return, or that was already released, is undefined behavior. The pool
 /// detects common cases (misaligned pointers, pointers that do not start a
 /// block, blocks of another pool, double frees of blocks that have not been
-/// reused, frees after the owning thread exited) and terminates the process
-/// with a diagnostic rather than corrupting its state.
+/// reused, frees of blocks whose owning thread has terminated) and
+/// terminates the process with a diagnostic rather than corrupting its state.
 class NANOALLOC_API Pool final {
 public:
     /// Minimum alignment of every returned pointer.
@@ -235,7 +299,8 @@ public:
 
     /// Releases an allocation. `ptr` must be nullptr (no effect) or a live
     /// pointer returned by allocate()/try_allocate() of this pool. Any thread
-    /// may release any block (subject to the thread lifetime contract).
+    /// may release any block while the thread that allocated it is running
+    /// (see the thread lifetime contract above).
     void deallocate(void* ptr) noexcept;
 
     /// Releases the blocks that other threads have deallocated on behalf of

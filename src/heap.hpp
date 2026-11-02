@@ -85,12 +85,13 @@ private:
     std::atomic<std::uint64_t> value_{0};
 };
 
-/// Statistics of one heap. Written only by the owning thread. The live
-/// allocation count and the allocation count are derived rather than stored,
-/// which keeps the allocation path to three counter updates.
+/// Statistics of one heap. Written only by the thread that currently owns the
+/// heap. A heap that is handed to a new thread keeps its counters, so they
+/// describe everything allocated through the heap since the pool was created.
+/// The live allocation count and the allocation count are derived rather than
+/// stored, which keeps the allocation path to three counter updates.
 struct HeapCounters {
     OwnerCounter local_frees;          // deallocations of own blocks
-    OwnerCounter remote_frees_sent;    // deallocations of other threads' blocks
     OwnerCounter remote_frees_drained; // own blocks released through the inbox
     OwnerCounter failed;               // failed allocations
     OwnerCounter splits;
@@ -111,7 +112,7 @@ struct HeapCounters {
         const std::uint64_t payload = live_payload.get();
         return consumed > payload ? (consumed - payload) / kHeaderSize : 0;
     }
-    /// Successful in-span allocations since the heap was created.
+    /// Successful in-span allocations made through this heap.
     [[nodiscard]] std::uint64_t allocations() const noexcept {
         return live_count() + local_frees.get() + remote_frees_drained.get();
     }
@@ -119,6 +120,12 @@ struct HeapCounters {
 
 class alignas(64) ThreadHeap {
 public:
+    /// kActive:     owned by a running thread.
+    /// kRetired:    its thread has left the pool (thread exit) while blocks
+    ///              were still allocated. Only that thread may still use it,
+    ///              from thread_local destructors that run after the exit hook.
+    /// kRecyclable: its thread has left and it holds no span; the next new
+    ///              thread adopts it instead of carving a new heap.
     enum Status : std::uint32_t { kActive = 0, kRetired = 1, kRecyclable = 2 };
 
     ThreadHeap(SpanProvider& provider, std::uint64_t pool_id, std::uint64_t thread_id) noexcept
@@ -183,8 +190,33 @@ public:
     /// `expected_word0` must be `this | ALLOCATED`.
     void enqueue_remote(Block* block, std::uint64_t expected_word0) noexcept;
 
+    /// Remote frees ever sent to this heap's inbox. Counted by the receiving
+    /// heap, before the block is published, so that it never trails
+    /// remote_frees_drained and is not lost when a sending thread exits.
+    [[nodiscard]] std::uint64_t remote_frees_received() const noexcept {
+        return remote_received_.load(std::memory_order_relaxed);
+    }
+    /// Blocks sent to the inbox and not yet drained (exact when quiescent).
+    [[nodiscard]] std::uint64_t pending_remote_frees() const noexcept {
+        const std::uint64_t drained = counters_.remote_frees_drained.get();
+        const std::uint64_t received = remote_frees_received();
+        return received > drained ? received - drained : 0;
+    }
+
+    /// Hands a recyclable heap (no spans, hence no blocks, an empty inbox and
+    /// empty buckets) to another thread. The counters are kept: they are part
+    /// of the pool's statistics. Caller holds the pool lock.
+    void adopt(std::uint64_t thread_id) noexcept {
+        thread_id_.store(thread_id, std::memory_order_relaxed);
+        set_status(kActive);
+    }
+
     [[nodiscard]] std::uint64_t pool_id() const noexcept { return pool_id_; }
-    [[nodiscard]] std::uint64_t thread_id() const noexcept { return thread_id_; }
+    /// The thread that owns (or last owned) the heap. Changes only under the
+    /// pool lock, when a recyclable heap is adopted.
+    [[nodiscard]] std::uint64_t thread_id() const noexcept {
+        return thread_id_.load(std::memory_order_relaxed);
+    }
     [[nodiscard]] Status status() const noexcept {
         return static_cast<Status>(status_.load(std::memory_order_acquire));
     }
@@ -256,15 +288,18 @@ private:
     }
     void drain_inbox() noexcept;
 
-    // ---- identity: written once, read by any thread ------------------------
+    // ---- identity: read by any thread ---------------------------------------
     SpanProvider* provider_;
     std::uint64_t pool_id_;
-    std::uint64_t thread_id_;
+    std::atomic<std::uint64_t> thread_id_;
     std::atomic<std::uint32_t> status_{kActive};
     Span* spans_ = nullptr;  // owner's spans (owner thread, or under pool lock)
 
     // ---- remote side: written by other threads -------------------------------
+    // The counter shares the inbox's cache line: a sender already owns that
+    // line exclusively for the push, so counting costs no extra transfer.
     alignas(64) std::atomic<std::uintptr_t> inbox_{0};
+    std::atomic<std::uint64_t> remote_received_{0};
 
     // ---- owner side ------------------------------------------------------------
     alignas(64) std::uint64_t summary_ = 0;
@@ -459,6 +494,9 @@ inline void ThreadHeap::release(Block* block, std::uint64_t word1) noexcept {
 }
 
 inline void ThreadHeap::enqueue_remote(Block* block, std::uint64_t expected_word0) noexcept {
+    // Counted before the push: the release CAS below orders the increment
+    // before the owner's drain, so received >= drained always holds for it.
+    remote_received_.fetch_add(1, std::memory_order_relaxed);
     std::uintptr_t head = inbox_.load(std::memory_order_relaxed);
     if (!std::atomic_ref<std::uint64_t>(block->word0)
              .compare_exchange_strong(expected_word0, head | kStatePending,

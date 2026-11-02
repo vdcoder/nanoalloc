@@ -126,7 +126,14 @@ NANO_TEST(fresh_pool_reports_consistent_statistics) {
     CHECK_EQ(stats.free_bytes, stats.capacity_bytes);
     CHECK(stats.largest_free_block > 0);
     CHECK(stats.largest_free_block <= stats.capacity_bytes);
-    CHECK(stats.metadata_bytes > 0);
+    // Nothing is carved from the arena before the first allocation, but the
+    // whole arena is already obtained from the system.
+    CHECK_EQ(stats.reserved_bytes, 0U);
+    CHECK_EQ(stats.metadata_bytes, 0U);
+    CHECK_EQ(stats.span_count, 0U);
+    CHECK_EQ(stats.thread_heap_count, 0U);
+    CHECK(stats.system_reserved_bytes > stats.capacity_bytes);
+    CHECK(stats.system_reserved_bytes < stats.capacity_bytes + 4096);
     // Requested sizes are recorded in the block headers, so tracking is on by
     // default and needs no side table.
     CHECK(stats.requested_bytes_tracked);

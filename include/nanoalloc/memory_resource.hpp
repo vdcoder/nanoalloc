@@ -21,7 +21,15 @@ namespace nanoalloc {
 /// and the resource must outlive every container or object using it.
 ///
 /// Errors follow the std::pmr conventions: allocation failure throws
-/// std::bad_alloc. Like the Pool itself, the resource is not thread-safe.
+/// std::bad_alloc.
+///
+/// Threads: the resource is as thread-safe as the Pool. Any thread may
+/// allocate through it and deallocate memory obtained through it, subject to
+/// the Pool's thread lifetime contract: memory is owned by the thread that
+/// allocated it, and other threads must finish using and releasing it before
+/// that thread begins to terminate. A container that is filled by one thread
+/// and destroyed by another is fine while the filling thread is running.
+/// (The containers themselves still need their usual synchronization.)
 ///
 /// Two MemoryResource objects compare equal when they refer to the same Pool,
 /// because memory allocated through one can be released through the other.

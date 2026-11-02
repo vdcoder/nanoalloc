@@ -16,7 +16,8 @@ if(NOT "thread" IN_LIST _nanoalloc_test_sanitizers)
 endif()
 
 foreach(test_name IN LISTS NANOALLOC_CONTRACT_TESTS)
-    add_executable(${test_name} ${test_name}.cpp test_framework.hpp test_helpers.hpp)
+    add_executable(${test_name} ${test_name}.cpp test_framework.hpp test_helpers.hpp
+                   test_stats.hpp)
     target_link_libraries(${test_name} PRIVATE nanoalloc::nanoalloc)
     target_compile_definitions(${test_name} PRIVATE
         NANOALLOC_EXPECTED_VERSION="${PROJECT_VERSION}")

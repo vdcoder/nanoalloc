@@ -32,7 +32,10 @@ namespace nanoalloc {
 ///     alignof(T) > Pool::max_alignment are rejected at compile time.
 ///   * allocate() throws std::bad_array_new_length if n * sizeof(T)
 ///     overflows, and std::bad_alloc if the pool cannot satisfy the request.
-///   * Not thread-safe, like the Pool itself.
+///   * As thread-safe as the Pool: copies of an allocator may be used from
+///     any threads, subject to the Pool's thread lifetime contract (other
+///     threads must finish using and releasing memory before the thread that
+///     allocated it begins to terminate).
 template <class T>
 class Allocator {
 public:

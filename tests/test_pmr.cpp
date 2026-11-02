@@ -8,10 +8,12 @@
 #include <cstdint>
 #include <deque>
 #include <list>
+#include <atomic>
 #include <map>
 #include <memory_resource>
 #include <new>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -233,6 +235,40 @@ NANO_TEST(pmr_upstream_for_standard_pool_resources) {
         CHECK(pool.stats().live_allocations > 0);
     }
     CHECK_EQ(pool.stats().live_allocations, 0U);
+    CHECK(pool.verify_integrity());
+}
+
+NANO_TEST(pmr_container_built_by_one_thread_and_destroyed_by_another) {
+    // Within the thread lifetime contract: the building thread stays alive
+    // until the other thread has destroyed the container.
+    Pool pool({16 * kMiB});
+    MemoryResource resource(pool);
+    std::atomic<int> phase{0};
+    std::pmr::vector<std::pmr::string>* built = nullptr;
+    std::thread builder([&] {
+        built = new std::pmr::vector<std::pmr::string>(&resource);
+        for (int i = 0; i < 500; ++i) {
+            const std::string text = "a string long enough to need storage #" + std::to_string(i);
+            built->emplace_back(text.c_str());
+        }
+        phase = 1;
+        while (phase.load() != 2) {
+            std::this_thread::yield();
+        }
+    });
+    while (phase.load() != 1) {
+        std::this_thread::yield();
+    }
+    const bool intact = built->size() == 500 &&
+                        (*built)[499] == "a string long enough to need storage #499";
+    delete built;  // every element is released by this thread, remotely
+    phase = 2;
+    builder.join();
+    CHECK(intact);
+    const nanoalloc::PoolStats stats = pool.stats();
+    CHECK_EQ(stats.live_allocations, 0U);
+    CHECK_EQ(stats.pending_remote_frees, 0U);
+    CHECK(stats.remote_deallocation_count >= 500U);
     CHECK(pool.verify_integrity());
 }
 

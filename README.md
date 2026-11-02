@@ -186,15 +186,26 @@ frees memory for others but rarely allocates itself can call
 `drain_pending_frees()` to return memory promptly. There is no background
 thread or timer.
 
-**Thread lifetime contract.** Memory allocated by a thread must not be
-accessed or freed by another thread after the allocating thread has begun to
-terminate. All cross-thread frees of a thread's blocks must have completed,
-with proper synchronization (for example, by joining the freeing threads),
-before that thread exits. When a thread exits it drains its inbox and returns
-its completely free spans to the pool for other threads; spans that still
-hold live blocks stay reserved until the pool is destroyed. Blocks of an
-exited thread may still be read, but freeing one is detected and reported as
-a fatal error.
+**Thread lifetime contract.** The thread that allocates a block owns it. All
+cross-thread accesses to a block, and its deallocation by another thread,
+must complete before the owner begins to terminate. "Complete" means ordered
+by synchronization the program has anyway: for example, the threads that use
+the block are joined, or signal the owner, before the owner's thread function
+returns. The owner itself may use its blocks until it has finished
+terminating.
+
+When a thread that used the pool terminates (as its `thread_local` objects are
+destroyed), the pool releases the frees waiting in its inbox and returns its
+completely free spans to the pool for other threads. Then:
+
+- Blocks the thread still owns stay allocated until the pool is destroyed,
+  and so do the spans that hold them. Other threads must not touch them; a
+  free from another thread is detected and reported as a fatal error.
+- `thread_local` destructors of the terminating thread that run later may
+  still use the pool: they may free the thread's own blocks (spans that become
+  free go back to the pool) and allocate. These late calls take the pool lock.
+- A thread heap that holds no span is reused by the next new thread, together
+  with its statistics.
 
 ## How it works
 
@@ -266,7 +277,13 @@ against the pool's budget, and are released by `deallocate()` as usual.
 - Allocation and deallocation never call the system allocator except for
   oversized requests; a thread's first allocation creates its heap inside the
   arena.
-- The pool never exceeds its budget and never falls back to another allocator.
+- Everything the pool hands out is charged against its budget: thread heaps,
+  spans and oversized allocations together never exceed `capacity_bytes`
+  (`reserved_bytes <= capacity_bytes`), and the pool never falls back to
+  another allocator. The budget is not a limit on the memory obtained from the
+  operating system: the arena is allocated in full at construction, and
+  oversized allocations are separate system allocations on top of it
+  (`system_reserved_bytes`, at most about twice the budget).
 - In single-threaded use, once everything has been freed `free_bytes` equals
   `capacity_bytes` and `largest_free_block` returns to its initial value.
 - Misuse (a pointer this pool did not return, an interior pointer, a double
@@ -280,7 +297,7 @@ everything.
 
 | `PoolConfig` member | Default | Meaning |
 | --- | --- | --- |
-| `capacity_bytes` | 0 (invalid) | Memory budget: arena for spans and thread heaps, plus oversized allocations |
+| `capacity_bytes` | 0 (invalid) | Memory budget for thread heaps, spans and oversized allocations; also the arena size |
 | `track_requested_bytes` | `true` | Report requested-byte statistics (free; `false` reports them as zero) |
 
 | `Pool` member | Behaviour |
@@ -306,8 +323,9 @@ storage is aligned to `max(alignof(T), 16)`.
 **Changes from release 0.1** (the buddy allocator): pools are now usable from
 many threads; `capacity_bytes` is a budget that also covers oversized
 allocations served by the system allocator; requested-byte tracking is on by
-default and free; `PoolStats` gained span, header, inbox, fragment and
-oversized-allocation fields; `drain_pending_frees()` is new.
+default and free; `PoolStats` gained reservation, span, thread-heap, header,
+inbox, fragment and oversized-allocation fields; `metadata_bytes` now counts
+bookkeeping carved from the arena; `drain_pending_frees()` is new.
 
 ## Memory accounting
 
@@ -316,26 +334,54 @@ oversized-allocation fields; `drain_pending_frees()` is new.
 | requested | the `bytes` passed to `allocate` |
 | usable | `usable_size()`: `round_up(bytes, 16)` for span blocks |
 | consumed | usable bytes plus the 16-byte header (span blocks), or the whole system allocation (oversized) |
-| reserved | arena memory carved for spans and thread heaps, plus oversized system memory |
+| reserved | charged against the budget: arena carved for thread heaps and spans, plus oversized system memory |
+
+`PoolStats` separates the budget, the memory obtained from the system and
+where each reserved byte is:
+
+| Field | Meaning |
+| --- | --- |
+| `capacity_bytes` | the budget |
+| `reserved_bytes` | budget charged so far; never above `capacity_bytes` |
+| `system_reserved_bytes` | memory obtained from the system: the whole arena, the pool object and live oversized allocations |
+| `metadata_bytes` | thread heap objects and the headers and fences of spans owned by threads |
+| `live_consumed_bytes` | live allocations, headers included (also `live_usable_bytes`, `live_requested_bytes`, `header_bytes`) |
+| `thread_free_bytes` | free blocks inside spans owned by threads (only the owner allocates from them); includes `fragment_bytes` |
+| `free_span_count` / `free_span_bytes` | completely free spans returned by exited threads, available to any thread |
+| `span_count` / `span_bytes` | all spans carved from the arena |
+| `oversized_live_allocations` / `oversized_live_bytes` / `oversized_reserved_bytes` | live oversized blocks: count, payload and system bytes |
+| `pending_remote_frees` | blocks freed by another thread and still waiting in their owner's inbox (they count as live) |
+| `thread_heap_count` / `active_thread_heap_count` | thread heaps carved, and those owned by a running thread |
+| `free_bytes` | `capacity_bytes - live_consumed_bytes`: a utilization figure, not memory the caller can allocate |
+| `largest_free_block` | the largest request the calling thread is guaranteed to get from a span now |
+
+When no other thread uses the pool during `stats()`:
+
+```
+reserved_bytes   == metadata_bytes + live_consumed_bytes + thread_free_bytes + free_span_bytes
+reserved_bytes   <= capacity_bytes
+allocation_count == deallocation_count + live_allocations - pending_remote_frees
+```
 
 *Payload slack* is usable − requested (0-15 bytes per span allocation). *Total
-allocator overhead* additionally includes the 16-byte headers
-(`header_bytes`), bookkeeping (`metadata_bytes`: thread heaps, span headers
-and fences), header-only free fragments (`fragment_bytes`) and free memory
-retained in spans (`reserved_bytes` − `live_consumed_bytes`).
+allocator overhead* adds the 16-byte headers (`header_bytes`), bookkeeping
+(`metadata_bytes`) and free memory held in spans (`thread_free_bytes`,
+`free_span_bytes`).
 
-`PoolStats` also reports `span_count`, `span_bytes`, `thread_heap_count`,
-`pending_remote_frees`, `oversized_live_allocations`/`bytes`, peaks of
-requested, usable and consumed bytes, `free_bytes`, `largest_free_block`
-(for the calling thread), and counts of allocations, local and remote
-deallocations, oversized allocations, failures, splits and merges.
+Counters cover the whole life of the pool: allocation, deallocation (local,
+remote and oversized), failure, split and merge counts, and peaks of
+requested, usable and consumed bytes. A remote free is counted once, by the
+heap that receives it, so `pending_remote_frees` is exactly the work waiting
+in inboxes. A thread heap reused by a new thread keeps its counters, so
+nothing is lost when threads come and go.
 
 Every counter is updated by the thread that owns it (no shared atomic
 counter on the allocation path) and read with relaxed atomic loads. Values
 are exact when no other thread uses the pool during `stats()`; under
 concurrent use each value is recent but fields may come from slightly
-different moments. Peaks are the sum of per-thread peaks: exact for one
-thread, an upper bound otherwise.
+different moments. Peaks are the sum of per-heap peaks (plus one for
+oversized blocks): exact when one thread allocates from spans only, an upper
+bound otherwise. They never decrease.
 
 ## Performance
 
@@ -386,7 +432,7 @@ cached chunks while nanoalloc splits and merges blocks every time.
 | --- | --- | --- |
 | Public contract | `contract` | alignment (1-4096), boundary sizes, zero-byte and null cases, read/write of the whole usable range, non-overlap, content integrity, exhaustion and recovery, large and oversized objects, statistics against a model, pmr and Allocator with standard containers, no system allocation during operations (`test_no_heap`) |
 | Stress | `stress` | deterministic randomized runs (8 scenarios x 4 seeds) verifying data patterns, non-overlap, statistics and `verify_integrity()` throughout; `NANOALLOC_STRESS_SEED`/`NANOALLOC_STRESS_SCALE` reproduce or extend a run |
-| Threads | `threads` | cross-thread frees, many threads freeing into one owner, explicit and implicit draining, concurrent frees while the owner allocates and drains, all-to-all exchange, thread exit with and without live blocks, span reuse after thread exit, concurrent statistics |
+| Threads | `threads` | cross-thread frees, many threads freeing into one owner, explicit and implicit draining, concurrent frees while the owner allocates and drains, all-to-all exchange, sharing blocks while their owner runs, span reuse after thread exit, statistics across heap reuse and thread churn (with concurrent remote frees), pool use from `thread_local` destructors, concurrent statistics |
 | Engine | `engine` | exact 16-byte rounding, header accounting, bucket layout, splitting at every small remainder, 16-byte fragments, immediate and multilevel coalescing, bitmap transitions, coarse-bucket search, span acquisition and boundaries, oversized allocations, several pools per thread, randomized fragmentation with full validation |
 | Misuse | `misuse` | double frees, foreign, misaligned and interior pointers, other pool, free after the owner exited; under ASan, use-after-free and overflow into free memory |
 
@@ -401,8 +447,16 @@ safety; under TSan `test_no_heap` is not built because it replaces the global
   it exits, even when they are empty, so reserved memory grows with the number
   of threads (about one or more 1 MiB spans per thread). Memory is never
   returned to the operating system while the pool lives.
-- **Thread lifetime contract** (see [Threads](#threads)): blocks of a thread
-  must not be freed by others after it begins to exit.
+- **Thread lifetime contract** (see [Threads](#threads)): other threads must
+  finish using and freeing a thread's blocks before it begins to exit. Blocks
+  a thread leaves allocated when it exits, and the spans holding them, stay
+  reserved until the pool is destroyed.
+- **Carved spans stay charged.** Spans are never returned to the budget while
+  the pool lives (free ones are reused by other threads), so a pool whose
+  arena has been carved into spans cannot serve oversized requests any more.
+- **System memory above the budget.** The arena is allocated in full at
+  construction; oversized allocations are additional system allocations, so
+  the memory obtained from the system can approach twice the budget.
 - **Remote frees are deferred**: a block freed by another thread is reused
   only after its owner allocates, frees or drains.
 - **16-byte header** per allocation: for very small objects the header can

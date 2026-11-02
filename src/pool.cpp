@@ -104,6 +104,9 @@ struct TlsSlot {
 struct ThreadState {
     std::uint64_t thread_id;
     TlsSlot slots[kTlsSlots];
+    // Set when the thread-exit hook has run: the thread's heaps are retired
+    // and its later calls (from thread_local destructors) take locked paths.
+    bool exiting;
 };
 
 thread_local constinit ThreadState t_state{};
@@ -208,7 +211,7 @@ public:
                 self->deallocate_local(block, word1);
                 return;
             }
-            deallocate_remote(owner, self, block, word0, ptr);
+            deallocate_remote(owner, block, word0, word1, ptr);
             return;
         }
         if (state == detail::kStateExternal) {
@@ -252,6 +255,12 @@ private:
     [[nodiscard]] ThreadHeap* current_heap_if_cached() const noexcept;
     ThreadHeap* current_heap_slow(bool create) noexcept;
     ThreadHeap* create_heap_locked(std::uint64_t thread_id) noexcept;
+    /// The heap an exiting thread allocates from (see exiting_heap()).
+    ThreadHeap* exiting_heap(std::uint64_t thread_id) noexcept;
+    /// Moves the heap's completely free spans to the free-span list and marks
+    /// a heap without spans recyclable. Caller holds mutex_; the heap is not
+    /// active.
+    void release_empty_spans_locked(ThreadHeap* heap) noexcept;
 
     static Block* checked_header(const void* ptr) noexcept {
         if ((detail::address_of(ptr) & (detail::kGranule - 1)) != 0) [[unlikely]] {
@@ -266,8 +275,8 @@ private:
             ptr);
     }
 
-    void deallocate_remote(ThreadHeap* owner, ThreadHeap* self, Block* block,
-                           std::uint64_t word0, const void* ptr) noexcept;
+    void deallocate_remote(ThreadHeap* owner, Block* block, std::uint64_t word0,
+                           std::uint64_t word1, const void* ptr) noexcept;
     void* allocate_external(std::size_t bytes, std::size_t alignment) noexcept;
     void deallocate_external(Block* block, std::uint64_t word0, const void* ptr) noexcept;
     /// Bytes still available in the budget (caller holds mutex_).
@@ -303,8 +312,6 @@ private:
     std::uint64_t external_frees_ = 0;
 
     std::atomic<std::uint64_t> failed_{0};
-    // Remote frees issued by threads that have no heap in this pool.
-    std::atomic<std::uint64_t> heapless_remote_frees_{0};
 };
 
 struct Pool::Impl final : PoolCore {
@@ -341,7 +348,11 @@ struct ThreadExitHook {
         for (PoolCore* pool : reg.pools) {
             pool->retire_thread(thread_id);
         }
+        // Keep the thread id: thread_local destructors that run after this
+        // one may still free this thread's blocks (see exiting_heap()).
         t_state = ThreadState{};
+        t_state.thread_id = thread_id;
+        t_state.exiting = true;
     }
 };
 
@@ -382,6 +393,12 @@ PoolCore::~PoolCore() {
 
 ThreadHeap* PoolCore::current_heap_slow(bool create) noexcept {
     const std::uint64_t thread_id = current_thread_id();
+    if (t_state.exiting) [[unlikely]] {
+        // No cached heap: every call of an exiting thread takes the slow
+        // paths, which keep its retired heap consistent with the pool.
+        t_state.slots[id_ & (kTlsSlots - 1)] = TlsSlot{id_, nullptr};
+        return create ? exiting_heap(thread_id) : nullptr;
+    }
     ThreadHeap* found = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -421,14 +438,12 @@ ThreadHeap* PoolCore::current_heap_if_cached() const noexcept {
 }
 
 ThreadHeap* PoolCore::create_heap_locked(std::uint64_t thread_id) noexcept {
-    // Reuse the heap object of an exited thread that left no blocks behind.
+    // Reuse the heap object of an exited thread that left no span behind. It
+    // keeps its counters, which belong to the pool's history.
     for (ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
         if (heap->status() == ThreadHeap::kRecyclable) {
-            ThreadHeap* next = heap->next_in_pool;
-            heap->~ThreadHeap();
-            auto* fresh = ::new (static_cast<void*>(heap)) ThreadHeap(*this, id_, thread_id);
-            fresh->next_in_pool = next;
-            return fresh;
+            heap->adopt(thread_id);
+            return heap;
         }
     }
     if (available_locked() < kHeapObjectSize) {
@@ -465,42 +480,72 @@ Span* PoolCore::acquire_span(std::size_t min_block) noexcept {
     return span;
 }
 
+ThreadHeap* PoolCore::exiting_heap(std::uint64_t thread_id) noexcept {
+    // A thread whose exit hook has run allocates from its own retired heap.
+    // No other thread uses a retired heap (remote frees into it violate the
+    // lifetime contract and are rejected), so the exiting thread can use it
+    // without the lock, like an active heap. If the heap became recyclable it
+    // is reclaimed, unless another thread has adopted it already.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
+        if (heap->thread_id() == thread_id && heap->status() != ThreadHeap::kActive) {
+            heap->set_status(ThreadHeap::kRetired);
+            return heap;
+        }
+    }
+    ThreadHeap* heap = create_heap_locked(thread_id);
+    if (heap != nullptr) {
+        heap->set_status(ThreadHeap::kRetired);
+    }
+    return heap;
+}
+
+void PoolCore::release_empty_spans_locked(ThreadHeap* heap) noexcept {
+    Span* empty = heap->take_empty_spans();
+    while (empty != nullptr) {
+        Span* next = empty->next;
+        empty->owner = nullptr;
+        empty->next = free_spans_;
+        free_spans_ = empty;
+        empty = next;
+    }
+    if (heap->spans() == nullptr) {
+        heap->set_status(ThreadHeap::kRecyclable);
+    }
+}
+
 void PoolCore::retire_thread(std::uint64_t thread_id) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     for (ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
-        if (heap->thread_id() != thread_id || heap->status() != ThreadHeap::kActive) {
-            continue;
+        if (heap->thread_id() == thread_id && heap->status() == ThreadHeap::kActive) {
+            heap->set_status(ThreadHeap::kRetired);
+            release_empty_spans_locked(heap);
         }
-        Span* empty = heap->take_empty_spans();
-        while (empty != nullptr) {
-            Span* next = empty->next;
-            empty->owner = nullptr;
-            empty->next = free_spans_;
-            free_spans_ = empty;
-            empty = next;
-        }
-        heap->set_status(heap->spans() == nullptr ? ThreadHeap::kRecyclable
-                                                  : ThreadHeap::kRetired);
     }
 }
 
 // ---- deallocation paths ------------------------------------------------------------
 
-void PoolCore::deallocate_remote(ThreadHeap* owner, ThreadHeap* self, Block* block,
-                                 std::uint64_t word0, const void* ptr) noexcept {
+void PoolCore::deallocate_remote(ThreadHeap* owner, Block* block, std::uint64_t word0,
+                                 std::uint64_t word1, const void* ptr) noexcept {
     if (owner->pool_id() != id_) {
         detail::fatal_error("pointer was not allocated by this pool", ptr);
     }
-    if (owner->status() != ThreadHeap::kActive) {
+    if (owner->status() != ThreadHeap::kActive) [[unlikely]] {
+        if (t_state.exiting && owner->thread_id() == t_state.thread_id &&
+            owner->status() == ThreadHeap::kRetired) {
+            // A thread_local destructor of the exiting owner frees its own
+            // block. The retired heap is private to this thread; spans that
+            // become free go back to the pool.
+            owner->deallocate_local(block, word1);
+            std::lock_guard<std::mutex> lock(mutex_);
+            release_empty_spans_locked(owner);
+            return;
+        }
         detail::fatal_error(
             "deallocation of a block whose owning thread has exited (thread lifetime "
             "contract violated)",
             ptr);
-    }
-    if (self != nullptr) {
-        self->counters().remote_frees_sent.add(1);
-    } else {
-        heapless_remote_frees_.fetch_add(1, std::memory_order_relaxed);
     }
     owner->enqueue_remote(block, word0);
 }
@@ -660,22 +705,32 @@ PoolStats PoolCore::stats() const noexcept {
     std::uint64_t live_requested = 0;
     std::uint64_t allocations = 0;
     std::uint64_t local_frees = 0;
-    std::uint64_t remote_sent = heapless_remote_frees_.load(std::memory_order_relaxed);
-    std::uint64_t remote_drained = 0;
+    std::uint64_t remote_received = 0;
+    std::uint64_t pending = 0;
     std::uint64_t failed = failed_.load(std::memory_order_relaxed);
     std::uint64_t peak_payload = 0;
     std::uint64_t peak_requested = 0;
     std::uint64_t peak_consumed = 0;
+    std::uint64_t owned_span_count = 0;
+    std::uint64_t thread_free = 0;
+    std::size_t active = 0;
     for (const ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
         const detail::HeapCounters& c = heap->counters();
-        live_count += c.live_count();
-        live_consumed += c.live_consumed.get();
+        // Under concurrent use the received and drained counts may come from
+        // different moments; pending_remote_frees() never goes below zero.
+        const std::uint64_t heap_pending = heap->pending_remote_frees();
+        const std::uint64_t heap_live = c.live_count();
+        const std::uint64_t heap_consumed = c.live_consumed.get();
+        const std::uint64_t heap_span_count = c.span_count.get();
+        const std::uint64_t heap_span_bytes = c.span_bytes.get();
+        live_count += heap_live;
+        live_consumed += heap_consumed;
         live_payload += c.live_payload.get();
         live_requested += c.live_requested.get();
         allocations += c.allocations();
         local_frees += c.local_frees.get();
-        remote_sent += c.remote_frees_sent.get();
-        remote_drained += c.remote_frees_drained.get();
+        remote_received += heap->remote_frees_received();
+        pending += heap_pending;
         failed += c.failed.get();
         peak_payload += c.peak_payload.get();
         peak_requested += c.peak_requested.get();
@@ -683,22 +738,32 @@ PoolStats PoolCore::stats() const noexcept {
         stats.split_count += c.splits.get();
         stats.merge_count += c.merges.get();
         stats.fragment_bytes += c.fragment_bytes.get();
+        owned_span_count += heap_span_count;
+        const std::uint64_t used = heap_span_count * detail::kSpanOverhead + heap_consumed;
+        thread_free += heap_span_bytes > used ? heap_span_bytes - used : 0;
+        active += heap->status() == ThreadHeap::kActive ? std::size_t{1} : std::size_t{0};
+    }
+    for (const Span* span = free_spans_; span != nullptr; span = span->next) {
+        ++stats.free_span_count;
+        stats.free_span_bytes += span->size;
     }
 
     stats.thread_heap_count = heap_count_;
+    stats.active_thread_heap_count = active;
     stats.span_count = carved_spans_;
     stats.span_bytes = carved_span_bytes_;
-    stats.metadata_bytes =
-        sizeof(PoolCore) + heap_count_ * kHeapObjectSize + carved_spans_ * detail::kSpanOverhead;
+    stats.metadata_bytes = heap_count_ * kHeapObjectSize + owned_span_count * detail::kSpanOverhead;
     stats.reserved_bytes = arena_used_ + external_reserved_;
+    stats.system_reserved_bytes = sizeof(PoolCore) + capacity_ + external_reserved_;
 
     stats.live_allocations = live_count + external_live_;
     stats.live_usable_bytes = live_payload + external_payload_;
     stats.live_consumed_bytes = live_consumed + external_reserved_;
     stats.header_bytes = live_count * kHeaderSize + (external_reserved_ - external_payload_);
-    stats.pending_remote_frees = remote_sent > remote_drained ? remote_sent - remote_drained : 0;
+    stats.pending_remote_frees = pending;
     stats.oversized_live_allocations = external_live_;
     stats.oversized_live_bytes = external_payload_;
+    stats.oversized_reserved_bytes = external_reserved_;
 
     stats.peak_usable_bytes = peak_payload + external_peak_payload_;
     stats.peak_consumed_bytes = peak_consumed + external_peak_consumed_;
@@ -707,15 +772,17 @@ PoolStats PoolCore::stats() const noexcept {
         stats.peak_requested_bytes = peak_requested + external_peak_requested_;
     }
 
-    stats.free_bytes = capacity_ - stats.live_consumed_bytes;
+    stats.free_bytes =
+        capacity_ > stats.live_consumed_bytes ? capacity_ - stats.live_consumed_bytes : 0;
+    stats.thread_free_bytes = thread_free;
     ThreadHeap* own = current_heap_if_cached();
     stats.largest_free_block = std::max(own != nullptr ? own->largest_free_payload() : 0,
                                         span_payload_available_locked(own != nullptr));
 
     stats.allocation_count = allocations + external_allocations_;
     stats.local_deallocation_count = local_frees;
-    stats.remote_deallocation_count = remote_sent;
-    stats.deallocation_count = local_frees + remote_sent + external_frees_;
+    stats.remote_deallocation_count = remote_received;
+    stats.deallocation_count = local_frees + remote_received + external_frees_;
     stats.oversized_allocation_count = external_allocations_;
     stats.failed_allocation_count = failed;
     return stats;
@@ -752,6 +819,7 @@ bool PoolCore::verify_integrity() const noexcept {
     }
     return heaps == heap_count_ && owned_spans + free_span_count == carved_spans_ &&
            owned_span_bytes + free_span_bytes == carved_span_bytes_ &&
+           arena_used_ == heap_count_ * kHeapObjectSize + carved_span_bytes_ &&
            external == external_live_ && arena_used_ + external_reserved_ <= capacity_;
 }
 

@@ -216,6 +216,7 @@ const char* ThreadHeap::validate() const noexcept {
     std::size_t free_listable = 0;
     std::size_t total_blocks = 0;
     std::uint64_t live_count = 0;
+    std::uint64_t pending = 0;
     std::uint64_t live_consumed = 0;
     std::uint64_t live_payload = 0;
     std::uint64_t live_requested = 0;
@@ -265,6 +266,7 @@ const char* ThreadHeap::validate() const noexcept {
                 }
                 const std::size_t payload = size - kHeaderSize;
                 ++live_count;
+                pending += state == kStatePending ? 1 : 0;
                 live_consumed += size;
                 live_payload += payload;
                 live_requested += payload - (word1 & kSlackMask);
@@ -338,11 +340,19 @@ const char* ThreadHeap::validate() const noexcept {
         c.live_requested.get() != live_requested) {
         return "live-allocation counters disagree with the blocks";
     }
+    if (c.remote_frees_drained.get() > remote_frees_received() ||
+        pending_remote_frees() != pending) {
+        return "remote-free counters disagree with the pending blocks";
+    }
     if (c.fragment_bytes.get() != fragments) {
         return "fragment counter disagrees with the blocks";
     }
     if (c.span_count.get() != span_count || c.span_bytes.get() != span_bytes) {
         return "span counters disagree with the span list";
+    }
+    if (status() == kRecyclable &&
+        (spans_ != nullptr || summary_ != 0 || inbox_.load(std::memory_order_relaxed) != 0)) {
+        return "a recyclable heap still holds spans, free blocks or pending frees";
     }
     return nullptr;
 }
