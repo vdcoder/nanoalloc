@@ -1,0 +1,16 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/install/
+CMakeUserPresets.json
+
+# IDE and tooling
+.vs/
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# Benchmark output
+*.csv
