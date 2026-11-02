@@ -593,6 +593,35 @@ NANO_TEST(reservation_is_made_of_exact_bookkeeping_and_blocks) {
     CHECK(pool.verify_integrity());
 }
 
+NANO_TEST(a_span_with_a_free_in_flight_is_not_released) {
+    // A remote free changes the block's state first and pushes it to the
+    // inbox afterwards. In between, the heap must keep the block's span (and
+    // so cannot become recyclable): the producer still refers to the heap.
+    TestProvider provider(4 * kMiB);
+    HeapPtr heap = make_heap(provider);
+    void* ptr = heap_alloc(*heap, 100);
+    Block* block = header_of(ptr);
+    const std::uint64_t allocated = load_word(block->word0);
+    store_word(block->word0, kStatePending);  // state changed, not yet pushed
+    CHECK(heap->take_empty_spans() == nullptr);
+    CHECK(heap->spans() != nullptr);
+    CHECK_EQ(heap->counters().live_count(), 1U);
+
+    store_word(block->word0, allocated);
+    heap->enqueue_remote(block, allocated);  // the complete publication
+    CHECK(heap->has_pending_frees());
+    CHECK_EQ(heap->pending_remote_frees(), 1U);
+    CHECK(heap->spans() != nullptr);
+    REQUIRE_HEAP_VALID(*heap);
+
+    Span* empty = heap->take_empty_spans();  // drains the inbox first
+    CHECK(empty != nullptr);
+    CHECK(heap->spans() == nullptr);
+    CHECK(!heap->has_pending_frees());
+    CHECK_EQ(heap->pending_remote_frees(), 0U);
+    CHECK_EQ(heap->counters().live_count(), 0U);
+}
+
 NANO_TEST(small_pools_use_smaller_spans) {
     Pool pool({256 * kKiB});
     void* ptr = pool.allocate(1000);

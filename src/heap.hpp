@@ -120,12 +120,14 @@ struct HeapCounters {
 
 class alignas(64) ThreadHeap {
 public:
-    /// kActive:     owned by a running thread.
-    /// kRetired:    its thread has left the pool (thread exit) while blocks
-    ///              were still allocated. Only that thread may still use it,
-    ///              from thread_local destructors that run after the exit hook.
-    /// kRecyclable: its thread has left and it holds no span; the next new
-    ///              thread adopts it instead of carving a new heap.
+    /// kActive:     owned by a running thread, the only thread that touches
+    ///              its free lists.
+    /// kRetired:    its thread has exited while blocks were still allocated.
+    ///              The heap now belongs to the pool's reclamation worker,
+    ///              which drains its inbox; any thread may still free its
+    ///              blocks (always through the inbox).
+    /// kRecyclable: no thread owns it and it holds no span (hence no block
+    ///              and no pending free); the next new thread adopts it.
     enum Status : std::uint32_t { kActive = 0, kRetired = 1, kRecyclable = 2 };
 
     ThreadHeap(SpanProvider& provider, std::uint64_t pool_id, std::uint64_t thread_id) noexcept
@@ -167,6 +169,11 @@ public:
         account_release(word1);
         counters_.local_frees.add(1);
         release(block, word1);
+    }
+
+    /// True if blocks are waiting in the inbox (any thread may ask).
+    [[nodiscard]] bool has_pending_frees() const noexcept {
+        return inbox_.load(std::memory_order_relaxed) != 0;
     }
 
     /// Processes the remote-free inbox if it is not empty.
@@ -238,6 +245,10 @@ public:
     [[nodiscard]] Span* spans() const noexcept { return spans_; }
 
     ThreadHeap* next_in_pool = nullptr;  // Pool's heap list (guarded by its mutex)
+    ThreadHeap* next_retired = nullptr;  // reclamation worker's list (guarded by its mutex)
+
+    /// The pool the heap belongs to.
+    [[nodiscard]] SpanProvider* provider() const noexcept { return provider_; }
 
 private:
     struct Fit {

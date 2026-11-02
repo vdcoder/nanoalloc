@@ -7,7 +7,8 @@ set(NANOALLOC_CONTRACT_TESTS
     test_stress
     test_pmr
     test_allocator
-    test_threads)
+    test_threads
+    test_retirement)
 # test_no_heap replaces the global operator new, which ThreadSanitizer's
 # runtime already defines; it cannot be linked in a TSan build.
 string(REPLACE "," ";" _nanoalloc_test_sanitizers "${NANOALLOC_SANITIZE}")
@@ -27,6 +28,7 @@ foreach(test_name IN LISTS NANOALLOC_CONTRACT_TESTS)
 endforeach()
 set_tests_properties(contract.test_stress PROPERTIES LABELS "contract;stress" TIMEOUT 1500)
 set_tests_properties(contract.test_threads PROPERTIES LABELS "contract;threads" TIMEOUT 1500)
+set_tests_properties(contract.test_retirement PROPERTIES LABELS "contract;threads" TIMEOUT 1500)
 
 # --- Engine implementation tests ------------------------------------------------
 # Compiled directly against the library sources so they can reach the internal
@@ -55,8 +57,7 @@ set(NANOALLOC_MISUSE_SCENARIOS
     "other_pool\;not allocated by this pool"
     "interior_pointer\;does not refer to the start of an allocated block"
     "misaligned_pointer\;not allocated by this pool"
-    "usable_size_after_free\;not allocated"
-    "free_after_owner_exit\;owning thread has exited")
+    "usable_size_after_free\;not allocated")
 foreach(entry IN LISTS NANOALLOC_MISUSE_SCENARIOS)
     list(GET entry 0 scenario)
     list(GET entry 1 message)

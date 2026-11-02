@@ -24,12 +24,12 @@ namespace nanoalloc {
 /// std::bad_alloc.
 ///
 /// Threads: the resource is as thread-safe as the Pool. Any thread may
-/// allocate through it and deallocate memory obtained through it, subject to
-/// the Pool's thread lifetime contract: memory is owned by the thread that
-/// allocated it, and other threads must finish using and releasing it before
-/// that thread begins to terminate. A container that is filled by one thread
-/// and destroyed by another is fine while the filling thread is running.
-/// (The containers themselves still need their usual synchronization.)
+/// allocate through it and deallocate memory obtained through it, also after
+/// the allocating thread has exited: a container filled by one thread may be
+/// destroyed by another at any time while the pool lives. A thread may not
+/// allocate from thread_local destructors that run after the pool has
+/// processed its exit (see Pool, Thread lifetime). (The containers themselves
+/// still need their usual synchronization.)
 ///
 /// Two MemoryResource objects compare equal when they refer to the same Pool,
 /// because memory allocated through one can be released through the other.

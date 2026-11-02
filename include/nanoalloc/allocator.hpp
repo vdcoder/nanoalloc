@@ -33,9 +33,9 @@ namespace nanoalloc {
 ///   * allocate() throws std::bad_array_new_length if n * sizeof(T)
 ///     overflows, and std::bad_alloc if the pool cannot satisfy the request.
 ///   * As thread-safe as the Pool: copies of an allocator may be used from
-///     any threads, subject to the Pool's thread lifetime contract (other
-///     threads must finish using and releasing memory before the thread that
-///     allocated it begins to terminate).
+///     any threads, and memory may outlive the thread that allocated it. A
+///     thread may not allocate from thread_local destructors that run after
+///     the pool has processed its exit (see Pool, Thread lifetime).
 template <class T>
 class Allocator {
 public:

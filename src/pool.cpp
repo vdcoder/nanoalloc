@@ -5,10 +5,13 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "block.hpp"
@@ -105,7 +108,8 @@ struct ThreadState {
     std::uint64_t thread_id;
     TlsSlot slots[kTlsSlots];
     // Set when the thread-exit hook has run: the thread's heaps are retired
-    // and its later calls (from thread_local destructors) take locked paths.
+    // and its later calls (from thread_local destructors) may not allocate
+    // and free through the owners' inboxes.
     bool exiting;
 };
 
@@ -174,7 +178,10 @@ public:
     }
 
     NANOALLOC_NOINLINE void* allocate_general(std::size_t bytes, std::size_t alignment) noexcept {
-        if (!is_supported_alignment(alignment)) [[unlikely]] {
+        if (!is_supported_alignment(alignment) || t_state.exiting) [[unlikely]] {
+            // A thread whose heaps have been retired (thread_local destructors
+            // after the exit hook) may not allocate: its heaps belong to the
+            // reclamation worker, and it gets no new one.
             failed_.fetch_add(1, std::memory_order_relaxed);
             return nullptr;
         }
@@ -231,7 +238,7 @@ public:
                 self->deallocate_local(block, word1);
                 return;
             }
-            deallocate_remote(owner, block, word0, word1, ptr);
+            deallocate_remote(owner, block, word0, ptr);
             return;
         }
         if (state == detail::kStateExternal) {
@@ -259,8 +266,17 @@ public:
         }
     }
 
-    /// Called at thread exit (under the registry lock) for every live pool.
+    /// Called at thread exit (under the registry lock) for every live pool:
+    /// hands the thread's heap to the reclamation worker, or marks it
+    /// recyclable if it holds no block.
     void retire_thread(std::uint64_t thread_id) noexcept;
+
+    enum class Reclaim { kIdle, kProgress, kRecycled };
+    /// One reclamation step for a retired heap, run by the reclamation worker
+    /// (the only thread that touches the heap's free lists): releases the
+    /// frees waiting in its inbox and returns spans that became empty to the
+    /// pool. kRecycled: the heap holds nothing any more and is recyclable.
+    Reclaim reclaim_retired(ThreadHeap* heap) noexcept;
 
     Span* acquire_span(std::size_t min_block) noexcept override;
 
@@ -275,11 +291,9 @@ private:
     [[nodiscard]] ThreadHeap* current_heap_if_cached() const noexcept;
     ThreadHeap* current_heap_slow(bool create) noexcept;
     ThreadHeap* create_heap_locked(std::uint64_t thread_id) noexcept;
-    /// The heap an exiting thread allocates from (see exiting_heap()).
-    ThreadHeap* exiting_heap(std::uint64_t thread_id) noexcept;
     /// Moves the heap's completely free spans to the free-span list and marks
-    /// a heap without spans recyclable. Caller holds mutex_; the heap is not
-    /// active.
+    /// a heap without spans recyclable. Caller holds mutex_ and is the heap's
+    /// exiting owner or the reclamation worker.
     void release_empty_spans_locked(ThreadHeap* heap) noexcept;
 
     static Block* checked_header(const void* ptr) noexcept {
@@ -296,7 +310,7 @@ private:
     }
 
     void deallocate_remote(ThreadHeap* owner, Block* block, std::uint64_t word0,
-                           std::uint64_t word1, const void* ptr) noexcept;
+                           const void* ptr) noexcept;
     void* allocate_external(std::size_t bytes, std::size_t alignment) noexcept;
     void deallocate_external(Block* block, std::uint64_t word0, const void* ptr) noexcept;
     /// Bytes still available in the budget (caller holds mutex_).
@@ -352,6 +366,108 @@ Registry& registry() {
     return *instance;
 }
 
+/// The process-wide reclamation worker for heaps of exited threads.
+///
+/// A thread that exits while its heap still has allocated blocks hands the
+/// heap over: from then on the worker is the only thread that touches the
+/// heap's free lists. Any thread may still free the heap's blocks, through
+/// its lock-free inbox as for any remote free. The worker periodically drains
+/// the inboxes of the heaps it holds (releasing and coalescing the blocks)
+/// and returns spans that became empty to their pool. A heap without blocks
+/// becomes recyclable and leaves the collection.
+///
+/// mutex_ guards the collection and is held for a whole pass, so registering
+/// a heap, dropping the heaps of a pool being destroyed and
+/// verify_integrity() never overlap with the worker touching a heap.
+/// Lock order: the registry mutex, then mutex_, then a pool's mutex.
+///
+/// Intentionally leaked, like the registry; its thread is detached and is
+/// started by the first hand-over.
+class Releaser {
+public:
+    std::mutex& mutex() noexcept { return mutex_; }
+
+    /// Takes over a retired heap. Its exiting owner has finished every
+    /// operation on the heap: the owner's release of mutex_ here orders them
+    /// before the worker's acquisition of mutex_ for its next pass.
+    void adopt(ThreadHeap* heap) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        heap->next_retired = retired_;
+        retired_ = heap;
+        if (!started_) {
+            try {
+                std::thread([this] { run(); }).detach();
+                started_ = true;
+            } catch (...) {
+                // No worker: the heap keeps its memory reserved, and the next
+                // hand-over tries again.
+            }
+        }
+        wake_.notify_one();
+    }
+
+    /// Drops the heaps of a pool that is being destroyed. While mutex_ is
+    /// held the worker is not inside a pass, and afterwards it cannot reach
+    /// the pool any more.
+    void forget(const detail::SpanProvider* pool) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (ThreadHeap** link = &retired_; *link != nullptr;) {
+            ThreadHeap* heap = *link;
+            if (heap->provider() == pool) {
+                *link = heap->next_retired;
+                heap->next_retired = nullptr;
+            } else {
+                link = &heap->next_retired;
+            }
+        }
+    }
+
+private:
+    // Poll quickly while there is work, then back off: a retired heap whose
+    // blocks are never freed costs one inbox check per kMaxInterval.
+    static constexpr std::chrono::milliseconds kMinInterval{1};
+    static constexpr std::chrono::milliseconds kMaxInterval{50};
+
+    void run() noexcept {
+        std::unique_lock<std::mutex> lock(mutex_);
+        std::chrono::milliseconds interval = kMinInterval;
+        for (;;) {
+            if (retired_ == nullptr) {
+                wake_.wait(lock, [this] { return retired_ != nullptr; });
+                interval = kMinInterval;
+            } else {
+                wake_.wait_for(lock, interval);
+            }
+            bool progress = false;
+            for (ThreadHeap** link = &retired_; *link != nullptr;) {
+                ThreadHeap* heap = *link;
+                const PoolCore::Reclaim result =
+                    static_cast<PoolCore*>(heap->provider())->reclaim_retired(heap);
+                progress = progress || result != PoolCore::Reclaim::kIdle;
+                if (result == PoolCore::Reclaim::kRecycled) {
+                    // Another thread may adopt the heap as soon as the pool's
+                    // lock is released; next_retired is only used here.
+                    *link = heap->next_retired;
+                    heap->next_retired = nullptr;
+                } else {
+                    link = &heap->next_retired;
+                }
+            }
+            interval = progress ? kMinInterval : std::min(interval * 2, kMaxInterval);
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    ThreadHeap* retired_ = nullptr;  // linked through ThreadHeap::next_retired
+    bool started_ = false;
+};
+
+Releaser& releaser() {
+    static Releaser* instance = new Releaser();
+    return *instance;
+}
+
 /// Its destructor runs when a thread that created a heap exits.
 struct ThreadExitHook {
     bool armed = false;
@@ -368,8 +484,9 @@ struct ThreadExitHook {
         for (PoolCore* pool : reg.pools) {
             pool->retire_thread(thread_id);
         }
-        // Keep the thread id: thread_local destructors that run after this
-        // one may still free this thread's blocks (see exiting_heap()).
+        // Forget every cached heap. thread_local destructors that run after
+        // this one find no heap: their allocations fail and their frees go
+        // through the owners' inboxes, like frees from any other thread.
         t_state = ThreadState{};
         t_state.thread_id = thread_id;
         t_state.exiting = true;
@@ -398,6 +515,8 @@ PoolCore::~PoolCore() {
         std::lock_guard<std::mutex> lock(reg.mutex);
         reg.pools.erase(std::find(reg.pools.begin(), reg.pools.end(), this));
     }
+    // After this the reclamation worker no longer touches the arena.
+    releaser().forget(this);
     for (ExternalLinks* node = external_; node != nullptr;) {
         ExternalLinks* next = node->next;
         Block* header = reinterpret_cast<Block*>(node + 1);
@@ -412,13 +531,12 @@ PoolCore::~PoolCore() {
 // ---- thread heaps --------------------------------------------------------------
 
 ThreadHeap* PoolCore::current_heap_slow(bool create) noexcept {
-    const std::uint64_t thread_id = current_thread_id();
     if (t_state.exiting) [[unlikely]] {
-        // No cached heap: every call of an exiting thread takes the slow
-        // paths, which keep its retired heap consistent with the pool.
+        // An exiting thread has no heap and gets none (see allocate_general).
         t_state.slots[id_ & (kTlsSlots - 1)] = TlsSlot{id_, nullptr};
-        return create ? exiting_heap(thread_id) : nullptr;
+        return nullptr;
     }
+    const std::uint64_t thread_id = current_thread_id();
     ThreadHeap* found = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -500,26 +618,6 @@ Span* PoolCore::acquire_span(std::size_t min_block) noexcept {
     return span;
 }
 
-ThreadHeap* PoolCore::exiting_heap(std::uint64_t thread_id) noexcept {
-    // A thread whose exit hook has run allocates from its own retired heap.
-    // No other thread uses a retired heap (remote frees into it violate the
-    // lifetime contract and are rejected), so the exiting thread can use it
-    // without the lock, like an active heap. If the heap became recyclable it
-    // is reclaimed, unless another thread has adopted it already.
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
-        if (heap->thread_id() == thread_id && heap->status() != ThreadHeap::kActive) {
-            heap->set_status(ThreadHeap::kRetired);
-            return heap;
-        }
-    }
-    ThreadHeap* heap = create_heap_locked(thread_id);
-    if (heap != nullptr) {
-        heap->set_status(ThreadHeap::kRetired);
-    }
-    return heap;
-}
-
 void PoolCore::release_empty_spans_locked(ThreadHeap* heap) noexcept {
     Span* empty = heap->take_empty_spans();
     while (empty != nullptr) {
@@ -535,38 +633,50 @@ void PoolCore::release_empty_spans_locked(ThreadHeap* heap) noexcept {
 }
 
 void PoolCore::retire_thread(std::uint64_t thread_id) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
-        if (heap->thread_id() == thread_id && heap->status() == ThreadHeap::kActive) {
-            heap->set_status(ThreadHeap::kRetired);
-            release_empty_spans_locked(heap);
+    ThreadHeap* retired = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
+            if (heap->thread_id() == thread_id && heap->status() == ThreadHeap::kActive) {
+                // The owner's last operations: release the frees waiting in
+                // the inbox and give completely free spans back to the pool.
+                // A heap left without spans holds no block and no pending
+                // free, so no other thread can still refer to it.
+                heap->set_status(ThreadHeap::kRetired);
+                release_empty_spans_locked(heap);
+                if (heap->status() == ThreadHeap::kRetired) {
+                    retired = heap;
+                }
+                break;
+            }
         }
     }
+    // Hand the heap over. Frees that other threads push to its inbox in the
+    // meantime simply wait there for the worker.
+    if (retired != nullptr) {
+        releaser().adopt(retired);
+    }
+}
+
+PoolCore::Reclaim PoolCore::reclaim_retired(ThreadHeap* heap) noexcept {
+    if (!heap->has_pending_frees()) {
+        return Reclaim::kIdle;
+    }
+    heap->drain_pending();
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_empty_spans_locked(heap);
+    return heap->status() == ThreadHeap::kRecyclable ? Reclaim::kRecycled : Reclaim::kProgress;
 }
 
 // ---- deallocation paths ------------------------------------------------------------
 
 void PoolCore::deallocate_remote(ThreadHeap* owner, Block* block, std::uint64_t word0,
-                                 std::uint64_t word1, const void* ptr) noexcept {
+                                 const void* ptr) noexcept {
     if (owner->pool_id() != id_) {
         detail::fatal_error("pointer was not allocated by this pool", ptr);
     }
-    if (owner->status() != ThreadHeap::kActive) [[unlikely]] {
-        if (t_state.exiting && owner->thread_id() == t_state.thread_id &&
-            owner->status() == ThreadHeap::kRetired) {
-            // A thread_local destructor of the exiting owner frees its own
-            // block. The retired heap is private to this thread; spans that
-            // become free go back to the pool.
-            owner->deallocate_local(block, word1);
-            std::lock_guard<std::mutex> lock(mutex_);
-            release_empty_spans_locked(owner);
-            return;
-        }
-        detail::fatal_error(
-            "deallocation of a block whose owning thread has exited (thread lifetime "
-            "contract violated)",
-            ptr);
-    }
+    // Whether the owner is running or has exited (its heap then belongs to
+    // the reclamation worker), the block goes to the owner's inbox.
     owner->enqueue_remote(block, word0);
 }
 
@@ -734,6 +844,7 @@ PoolStats PoolCore::stats() const noexcept {
     std::uint64_t owned_span_count = 0;
     std::uint64_t thread_free = 0;
     std::size_t active = 0;
+    std::size_t retired = 0;
     for (const ThreadHeap* heap = heaps_; heap != nullptr; heap = heap->next_in_pool) {
         const detail::HeapCounters& c = heap->counters();
         // Under concurrent use the received and drained counts may come from
@@ -762,6 +873,7 @@ PoolStats PoolCore::stats() const noexcept {
         const std::uint64_t used = heap_span_count * detail::kSpanOverhead + heap_consumed;
         thread_free += heap_span_bytes > used ? heap_span_bytes - used : 0;
         active += heap->status() == ThreadHeap::kActive ? std::size_t{1} : std::size_t{0};
+        retired += heap->status() == ThreadHeap::kRetired ? std::size_t{1} : std::size_t{0};
     }
     for (const Span* span = free_spans_; span != nullptr; span = span->next) {
         ++stats.free_span_count;
@@ -770,6 +882,7 @@ PoolStats PoolCore::stats() const noexcept {
 
     stats.thread_heap_count = heap_count_;
     stats.active_thread_heap_count = active;
+    stats.retired_thread_heap_count = retired;
     stats.span_count = carved_spans_;
     stats.span_bytes = carved_span_bytes_;
     stats.metadata_bytes = heap_count_ * kHeapObjectSize + owned_span_count * detail::kSpanOverhead;
@@ -809,6 +922,8 @@ PoolStats PoolCore::stats() const noexcept {
 }
 
 bool PoolCore::verify_integrity() const noexcept {
+    // Keep the reclamation worker out of the heaps while they are checked.
+    std::lock_guard<std::mutex> worker(releaser().mutex());
     std::lock_guard<std::mutex> lock(mutex_);
     std::size_t heaps = 0;
     std::size_t owned_spans = 0;

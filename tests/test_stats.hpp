@@ -8,7 +8,9 @@
 
 #include <nanoalloc/pool.hpp>
 
+#include <chrono>
 #include <cstdio>
+#include <thread>
 
 namespace nanotest {
 
@@ -33,7 +35,8 @@ inline bool stats_are_consistent(const nanoalloc::PoolStats& s) {
            "free_bytes == capacity - live consumed");
     expect(s.free_span_count <= s.span_count && s.free_span_bytes <= s.span_bytes,
            "free spans are a subset of the carved spans");
-    expect(s.active_thread_heap_count <= s.thread_heap_count, "active heaps <= heaps");
+    expect(s.active_thread_heap_count + s.retired_thread_heap_count <= s.thread_heap_count,
+           "active + retired heaps <= heaps");
     expect(s.fragment_bytes <= s.thread_free_bytes, "fragments are part of thread free bytes");
 
     // Live usage.
@@ -66,6 +69,44 @@ inline bool stats_are_consistent(const nanoalloc::PoolStats& s) {
                s.deallocation_count + s.live_allocations - s.pending_remote_frees,
            "allocations == deallocations + live - pending");
     return ok;
+}
+
+/// Waits until the reclamation worker has processed every retired heap of
+/// `pool` (none left, no pending frees) and returns the final snapshot in
+/// `out`. Returns false after `timeout`.
+inline bool wait_for_reclamation(const nanoalloc::Pool& pool, nanoalloc::PoolStats& out,
+                                 std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        out = pool.stats();
+        if (out.retired_thread_heap_count == 0 && out.pending_remote_frees == 0) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::fprintf(stderr, "  reclamation timed out: %zu retired heaps, %zu pending frees\n",
+                         out.retired_thread_heap_count, out.pending_remote_frees);
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+/// Waits until `pool` has no pending remote frees (the reclamation worker
+/// has processed the frees of retired heaps) without requiring the retired
+/// heaps themselves to be gone.
+inline bool wait_for_no_pending(const nanoalloc::Pool& pool, nanoalloc::PoolStats& out,
+                                std::chrono::milliseconds timeout = std::chrono::seconds(30)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        out = pool.stats();
+        if (out.pending_remote_frees == 0) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 /// True if no counter or peak of `later` is below its value in `earlier`.

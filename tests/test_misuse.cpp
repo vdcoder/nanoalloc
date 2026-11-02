@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <thread>
 
 namespace {
 
@@ -71,12 +70,6 @@ int run(const char* scenario) {
         low_block[pool.usable_size(low_block) + 16] = 1;
         pool.deallocate(low_block);
         pool.deallocate(keep);
-    } else if (std::strcmp(scenario, "free_after_owner_exit") == 0) {
-        // Violates the thread lifetime contract: the owner has exited.
-        void* ptr = nullptr;
-        std::thread owner([&] { ptr = pool.allocate(64); });
-        owner.join();
-        pool.deallocate(ptr);
     } else if (std::strcmp(scenario, "usable_size_after_free") == 0) {
         void* ptr = pool.allocate(100);
         pool.deallocate(ptr);

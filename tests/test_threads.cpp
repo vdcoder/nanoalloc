@@ -3,15 +3,13 @@
 //
 // Multithreaded contract tests: cross-thread deallocation through the owner's
 // inbox, explicit and implicit draining, concurrent producers while the owner
-// drains, thread exit under the documented lifetime contract, reuse of the
-// heaps of exited threads, statistics across thread churn, and pool use from
-// thread_local destructors. Intended to be run under ThreadSanitizer as well.
+// drains, thread exit, reuse of the heaps of exited threads, and statistics
+// across thread churn. Allocations that outlive their thread are covered in
+// more depth by test_retirement. Intended to be run under ThreadSanitizer as
+// well.
 //
 // All test-harness synchronization (mutexes, atomics, joins) happens outside
-// the pool. Every cross-thread access or free of a block completes, through
-// that synchronization, before the block's owner begins to terminate, as the
-// thread lifetime contract requires; blocks left by an exited thread are
-// never touched again.
+// the pool.
 #include <nanoalloc/pool.hpp>
 
 #include <atomic>
@@ -60,48 +58,6 @@ void wait_for(const std::atomic<unsigned>& counter, unsigned target) {
     while (counter.load() < target) {
         std::this_thread::yield();
     }
-}
-
-/// Uses a pool from a thread_local destructor. The object is constructed when
-/// a thread first touches it; touched before the thread's first allocation, its
-/// destructor runs after the pool has processed the thread's exit.
-struct ExitTimeUser {
-    Pool* pool = nullptr;
-    std::vector<Item> blocks;   // freed by the destructor
-    bool allocate_at_exit = false;
-
-    ExitTimeUser() = default;
-    ExitTimeUser(const ExitTimeUser&) = delete;
-    ExitTimeUser& operator=(const ExitTimeUser&) = delete;
-    ~ExitTimeUser();
-};
-
-std::atomic<bool> g_exit_time_intact{true};
-std::atomic<unsigned> g_exit_time_destructors{0};
-thread_local ExitTimeUser t_exit_time_user;
-
-ExitTimeUser::~ExitTimeUser() {
-    if (pool == nullptr) {
-        return;
-    }
-    for (const Item& item : blocks) {
-        if (!check_item(item)) {
-            g_exit_time_intact = false;
-        }
-        pool->deallocate(item.ptr);
-    }
-    if (allocate_at_exit) {
-        // A temporary allocation, and one that stays live after the thread.
-        void* temporary = pool->allocate(5000);
-        nanotest::fill_pattern(temporary, 5000, 5);
-        if (!nanotest::check_pattern(temporary, 5000, 5)) {
-            g_exit_time_intact = false;
-        }
-        pool->deallocate(temporary);
-        void* kept = pool->allocate(64);
-        nanotest::fill_pattern(kept, 64, 6);
-    }
-    g_exit_time_destructors.fetch_add(1);
 }
 
 }  // namespace
@@ -460,25 +416,38 @@ NANO_TEST(blocks_are_shared_while_their_owner_runs) {
     phase = 2;
     owner.join();
     CHECK(intact);
-    // The owner drained the 50 frees when it exited. The other 50 blocks
-    // stay allocated, untouched, until the pool is destroyed, and so does the
-    // span that holds them.
+    // The owner drained the 50 frees when it exited. Its heap still holds the
+    // other 50 blocks and was handed to the reclamation worker.
     const PoolStats stats = pool.stats();
     CHECK_EQ(stats.live_allocations, 50U);
     CHECK_EQ(stats.pending_remote_frees, 0U);
     CHECK_EQ(stats.remote_deallocation_count, 50U);
     CHECK_EQ(stats.thread_heap_count, 1U);
     CHECK_EQ(stats.active_thread_heap_count, 0U);
+    CHECK_EQ(stats.retired_thread_heap_count, 1U);
     CHECK_EQ(stats.span_count, 1U);
     CHECK_EQ(stats.free_span_count, 0U);
     CHECK(nanotest::stats_are_consistent(stats));
     CHECK(pool.verify_integrity());
 
-    // A new thread cannot reuse the retained heap; it gets its own.
+    // A new thread cannot reuse the retired heap; it gets its own.
     std::thread next([&] { pool.deallocate(pool.allocate(64)); });
     next.join();
     CHECK_EQ(pool.stats().thread_heap_count, 2U);
     CHECK_EQ(pool.stats().live_allocations, 50U);
+    CHECK(pool.verify_integrity());
+
+    // The remaining blocks outlive their owner and can still be freed.
+    for (std::size_t i = 1; i < handed.size(); i += 2) {
+        intact = intact && nanotest::check_pattern(handed[i], 200, 42);
+        pool.deallocate(handed[i]);
+    }
+    CHECK(intact);
+    PoolStats after{};
+    CHECK(nanotest::wait_for_reclamation(pool, after));
+    CHECK_EQ(after.live_allocations, 0U);
+    CHECK_EQ(after.free_span_count, after.span_count);
+    CHECK(nanotest::stats_are_consistent(after));
     CHECK(pool.verify_integrity());
 }
 
@@ -540,8 +509,6 @@ NANO_TEST(pools_are_independent_across_threads) {
         }
     });
     worker.join();
-    // NOTE: freeing these here would violate the lifetime contract (the
-    // worker has exited), so the main thread allocates its own instead.
     std::vector<void*> local;
     for (int i = 0; i < 500; ++i) {
         local.push_back(first.allocate(32));
@@ -555,6 +522,23 @@ NANO_TEST(pools_are_independent_across_threads) {
     }
     CHECK_EQ(first.stats().live_allocations, 500U);
     CHECK_EQ(second.stats().live_allocations, 500U);
+    CHECK(first.verify_integrity());
+    CHECK(second.verify_integrity());
+    // The worker's blocks outlived it; each pool reclaims its own.
+    for (void* ptr : from_second) {
+        CHECK(second.owns(ptr));
+        second.deallocate(ptr);
+    }
+    PoolStats stats{};
+    CHECK(nanotest::wait_for_reclamation(second, stats));
+    CHECK_EQ(stats.live_allocations, 0U);
+    CHECK_EQ(first.stats().live_allocations, 500U);
+    CHECK_EQ(first.stats().retired_thread_heap_count, 1U);
+    for (void* ptr : from_first) {
+        first.deallocate(ptr);
+    }
+    CHECK(nanotest::wait_for_reclamation(first, stats));
+    CHECK_EQ(stats.live_allocations, 0U);
     CHECK(first.verify_integrity());
     CHECK(second.verify_integrity());
 }
@@ -758,75 +742,6 @@ NANO_TEST(thread_churn_with_concurrent_remote_frees_keeps_exact_totals) {
     CHECK(stats.thread_heap_count <= per_round + 1);
     CHECK_EQ(stats.active_thread_heap_count, 1U);
     CHECK(nanotest::stats_are_consistent(stats));
-    CHECK(pool.verify_integrity());
-}
-
-// ---------------------------------------------------------------------------
-// thread_local destructors that run after the pool processed the thread exit
-// ---------------------------------------------------------------------------
-
-NANO_TEST(thread_local_destructors_may_free_the_threads_own_blocks) {
-    Pool pool({16 * kMiB});
-    g_exit_time_destructors = 0;
-    g_exit_time_intact = true;
-    std::thread worker([&] {
-        t_exit_time_user.pool = &pool;  // constructed before the first allocation
-        Rng rng(77);
-        for (int i = 0; i < 200; ++i) {
-            t_exit_time_user.blocks.push_back(make_item(pool, rng, 100000));
-        }
-    });
-    worker.join();
-    CHECK_EQ(g_exit_time_destructors.load(), 1U);
-    CHECK(g_exit_time_intact.load());
-    PoolStats stats = pool.stats();
-    CHECK_EQ(stats.live_allocations, 0U);
-    CHECK_EQ(stats.allocation_count, 200U);
-    CHECK_EQ(stats.local_deallocation_count, 200U);
-    CHECK_EQ(stats.active_thread_heap_count, 0U);
-    // Spans emptied by the destructor went back to the pool.
-    CHECK(stats.span_count >= 2);
-    CHECK_EQ(stats.free_span_count, stats.span_count);
-    CHECK(nanotest::stats_are_consistent(stats));
-    CHECK(pool.verify_integrity());
-
-    // The heap holds nothing, so the next thread adopts it.
-    std::thread next([&] { pool.deallocate(pool.allocate(64)); });
-    next.join();
-    stats = pool.stats();
-    CHECK_EQ(stats.thread_heap_count, 1U);
-    CHECK_EQ(stats.allocation_count, 201U);
-    CHECK(pool.verify_integrity());
-}
-
-NANO_TEST(thread_local_destructors_may_allocate_after_exit_processing) {
-    Pool pool({16 * kMiB});
-    g_exit_time_destructors = 0;
-    g_exit_time_intact = true;
-    std::thread worker([&] {
-        t_exit_time_user.pool = &pool;
-        t_exit_time_user.allocate_at_exit = true;
-        Rng rng(78);
-        t_exit_time_user.blocks.push_back(make_item(pool, rng, 512));
-    });
-    worker.join();
-    CHECK_EQ(g_exit_time_destructors.load(), 1U);
-    CHECK(g_exit_time_intact.load());
-    // The block allocated last by the destructor stays live, with its span,
-    // owned by the exited thread's heap.
-    const PoolStats stats = pool.stats();
-    CHECK_EQ(stats.allocation_count, 3U);
-    CHECK_EQ(stats.deallocation_count, 2U);
-    CHECK_EQ(stats.live_allocations, 1U);
-    CHECK_EQ(stats.thread_heap_count, 1U);
-    CHECK_EQ(stats.active_thread_heap_count, 0U);
-    CHECK_EQ(stats.span_count - stats.free_span_count, 1U);
-    CHECK(nanotest::stats_are_consistent(stats));
-    CHECK(pool.verify_integrity());
-
-    std::thread next([&] { pool.deallocate(pool.allocate(64)); });
-    next.join();
-    CHECK_EQ(pool.stats().thread_heap_count, 2U);
     CHECK(pool.verify_integrity());
 }
 

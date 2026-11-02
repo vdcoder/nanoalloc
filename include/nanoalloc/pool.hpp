@@ -100,10 +100,13 @@ struct PoolStats {
     /// span is carved.
     std::size_t free_span_count = 0;
     std::size_t free_span_bytes = 0;
-    /// Per-thread heaps ever carved for this pool, and those owned by a
-    /// running thread. Heaps of exited threads that hold no memory are reused.
+    /// Per-thread heaps ever carved for this pool; those owned by a running
+    /// thread; and retired heaps: heaps of exited threads that still hold
+    /// allocated blocks (or frees not processed yet), managed by the
+    /// reclamation worker. Heaps that hold no memory are reused by new threads.
     std::size_t thread_heap_count = 0;
     std::size_t active_thread_heap_count = 0;
+    std::size_t retired_thread_heap_count = 0;
 
     // --- Live usage (current values) ------------------------------------------
     /// Allocations not yet returned to free memory, including blocks released
@@ -213,27 +216,29 @@ struct PoolStats {
 /// concurrently from any threads. verify_integrity() requires that no other
 /// thread uses the pool during the call.
 ///
-/// Thread lifetime contract: the thread that allocates a block owns it. All
-/// accesses to a block by other threads, including its deallocation, must
-/// complete before its owner begins to terminate; "complete" means ordered by
-/// synchronization the program has anyway, for example joining the threads
-/// that use the block, or having them signal the owner, before the owner's
-/// thread function returns. The owner itself may use its blocks until it has
-/// finished terminating.
+/// Thread lifetime: allocations may outlive the thread that made them. A
+/// block stays valid until it is deallocated or the pool is destroyed, and
+/// any thread may access or deallocate it, before or after the allocating
+/// thread has exited (with the synchronization any shared object needs).
 ///
 /// When a thread that used the pool terminates (when its thread_local objects
-/// are destroyed), the pool releases the frees pending in its inbox and
-/// returns its completely free spans to the pool for other threads. Then:
-///   * Blocks it still owns stay allocated until the pool is destroyed, and
-///     their spans stay with its heap. Other threads must not access them;
-///     a deallocation by another thread is detected and terminates the
-///     process with a diagnostic.
-///   * thread_local destructors of the terminating thread that run later may
-///     still use the pool: they may free the thread's own blocks (spans that
-///     become free return to the pool) and allocate. These calls take the
-///     pool's lock; memory they leave allocated stays with the thread's heap.
-///   * A per-thread heap that holds no span is reused by the next thread that
-///     uses the pool, with its statistics.
+/// are destroyed), the pool releases the frees pending in its per-thread heap
+/// and returns the heap's completely free spans to the pool. Then:
+///   * A heap that still holds allocated blocks is retired: it is handed to a
+///     process-wide reclamation worker. Frees of its blocks by any thread go
+///     to its inbox, as other remote frees do; the worker processes them
+///     asynchronously (typically within milliseconds), returns spans that
+///     become empty to the pool for other threads, and makes the heap
+///     reusable once it holds no block.
+///   * The terminating thread may not allocate any more: in thread_local
+///     destructors that run after this point, allocate() throws
+///     std::bad_alloc and try_allocate() returns nullptr, for every pool.
+///     Its deallocations are accepted and go through the owners' inboxes.
+///   * A heap that holds no block is reused by the next thread that uses the
+///     pool, together with its statistics.
+/// Until the worker has processed them, frees of a retired heap's blocks
+/// count as pending (PoolStats::pending_remote_frees) and their memory as
+/// live.
 ///
 /// Lifetime: the Pool must outlive every allocation made from it and every
 /// adapter (MemoryResource, Allocator) and container that refers to it.
@@ -244,7 +249,7 @@ struct PoolStats {
 /// not return, or that was already released, is undefined behavior. The pool
 /// detects common cases (misaligned pointers, pointers that do not start a
 /// block, blocks of another pool, double frees of blocks that have not been
-/// reused, frees of blocks whose owning thread has terminated) and
+/// reused) and
 /// terminates the process with a diagnostic rather than corrupting its state.
 class NANOALLOC_API Pool final {
 public:
@@ -299,8 +304,8 @@ public:
 
     /// Releases an allocation. `ptr` must be nullptr (no effect) or a live
     /// pointer returned by allocate()/try_allocate() of this pool. Any thread
-    /// may release any block while the thread that allocated it is running
-    /// (see the thread lifetime contract above).
+    /// may release any block, also after the thread that allocated it has
+    /// exited (see Thread lifetime above).
     void deallocate(void* ptr) noexcept;
 
     /// Releases the blocks that other threads have deallocated on behalf of
@@ -327,7 +332,8 @@ public:
 
     /// Checks the internal data structures for consistency. Runs in time
     /// proportional to the reserved memory; intended for tests and debugging.
-    /// No other thread may use the pool during the call.
+    /// No other thread may use the pool during the call; the call waits until
+    /// the reclamation worker is between passes and keeps it waiting.
     [[nodiscard]] bool verify_integrity() const noexcept;
 
 private:
