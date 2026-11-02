@@ -152,6 +152,7 @@ Results (local, GCC 13.3 and Clang 18, warnings as errors):
 | GCC ASan + UBSan, Clang ASan + UBSan | 22/22 tests |
 | Clang TSan | 19/19 tests |
 | Repeated runs | `test_retirement`: TSan 9/9, ASan 4/4; `test_threads`: TSan 8/8 |
+| CI (run 41528212477) | Linux GCC/Clang Debug, Release, ASan + UBSan, TSan, shared + install + consumer; Windows MSVC Debug, Release, Debug + ASan: all 13 jobs pass |
 | Shared library, install, `find_package` consumer | 20/20 tests, consumer runs |
 | Export without `.git` | 20/20 tests |
 
@@ -177,6 +178,26 @@ processes [range]:
 All within the noise floor of the method: a comparison of identical builds
 gives 0.96-1.01, and `lifo` 0.87-1.10 across processes. The hot paths are
 unchanged.
+
+The same comparison in CI (run 41528212477, three processes per runner),
+combined time ratio after / before:
+
+| Workload | Linux, GCC 13.3, Intel Xeon 6973P-C | Windows, MSVC 19.44, AMD EPYC 9V74 |
+| --- | ---: | ---: |
+| small | 1.02 | 1.00 |
+| medium | 0.97 | 0.98 |
+| mixed | 0.99 | 0.99 |
+| lifo | 0.92 | 0.93 |
+| random | 1.00 | 0.99 |
+| bursts | 0.97 | 0.94 |
+| long_short | 1.00 | 0.99 |
+| fragmentation | 0.97 | 0.99 |
+| reuse | 1.02 | 1.01 |
+
+The allocation and deallocation fast paths are the same code before and
+after. The few-percent differences in both directions come from code
+placement and are of the size the method resolves on these machines; they
+do not show a systematic change.
 
 **Multithreaded** (`nanoalloc_mtbench`, 4 threads, 10 alternating runs per
 build): combined throughput medians of 116 (before) and 132 (after) Mops/s
