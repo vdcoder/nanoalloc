@@ -408,6 +408,11 @@ NANO_TEST(thread_exit_returns_empty_spans_for_reuse) {
     const std::size_t spans = stats.span_count;
     CHECK(spans >= 4);
     CHECK_EQ(stats.thread_heap_count, 1U);
+    // All spans went back to the pool; no thread owns free memory any more.
+    CHECK_EQ(stats.free_span_count, spans);
+    CHECK_EQ(stats.free_span_bytes, stats.span_bytes);
+    CHECK_EQ(stats.thread_free_bytes, 0U);
+    CHECK(nanotest::stats_are_consistent(stats));
     CHECK(pool.verify_integrity());
 
     std::thread second([&] {
@@ -423,7 +428,10 @@ NANO_TEST(thread_exit_returns_empty_spans_for_reuse) {
     stats = pool.stats();
     CHECK_EQ(stats.span_count, spans);        // spans were reused, not carved
     CHECK_EQ(stats.thread_heap_count, 1U);    // the heap object was recycled
+    CHECK_EQ(stats.free_span_count, spans);
     CHECK_EQ(stats.live_allocations, 0U);
+    CHECK_EQ(stats.allocation_count, 80U);
+    CHECK(nanotest::stats_are_consistent(stats));
     CHECK(pool.verify_integrity());
 }
 

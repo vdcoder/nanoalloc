@@ -571,6 +571,28 @@ NANO_TEST(blocks_never_cross_span_boundaries) {
     CHECK(pool.verify_integrity());
 }
 
+NANO_TEST(reservation_is_made_of_exact_bookkeeping_and_blocks) {
+    constexpr std::size_t kHeapObject = (sizeof(ThreadHeap) + 63) / 64 * 64;
+    Pool pool({8 * kMiB});
+    void* ptr = pool.allocate(1000);  // a 1024-byte block (1008 payload + header)
+    PoolStats stats = pool.stats();
+    CHECK_EQ(stats.thread_heap_count, 1U);
+    CHECK_EQ(stats.span_count, 1U);
+    CHECK_EQ(stats.span_bytes, kSpanSize);
+    CHECK_EQ(stats.metadata_bytes, kHeapObject + kSpanOverhead);
+    CHECK_EQ(stats.reserved_bytes, kHeapObject + kSpanSize);
+    CHECK_EQ(stats.live_consumed_bytes, 1024U);
+    CHECK_EQ(stats.thread_free_bytes, kSpanSize - kSpanOverhead - 1024);
+    CHECK_EQ(stats.free_span_bytes, 0U);
+    CHECK_EQ(stats.reserved_bytes, stats.metadata_bytes + stats.live_consumed_bytes +
+                                       stats.thread_free_bytes + stats.free_span_bytes);
+    CHECK(stats.system_reserved_bytes - stats.capacity_bytes < 4096);
+    pool.deallocate(ptr);
+    stats = pool.stats();
+    CHECK_EQ(stats.thread_free_bytes, kSpanSize - kSpanOverhead);
+    CHECK(pool.verify_integrity());
+}
+
 NANO_TEST(small_pools_use_smaller_spans) {
     Pool pool({256 * kKiB});
     void* ptr = pool.allocate(1000);

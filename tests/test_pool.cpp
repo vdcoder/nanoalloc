@@ -19,6 +19,7 @@
 
 #include "test_framework.hpp"
 #include "test_helpers.hpp"
+#include "test_stats.hpp"
 
 using nanoalloc::Pool;
 using nanoalloc::PoolConfig;
@@ -797,6 +798,7 @@ NANO_TEST(statistics_are_accurate) {
         CHECK(stats.peak_consumed_bytes >= stats.live_consumed_bytes);
         CHECK_EQ(stats.allocation_count, allocations);
         CHECK_EQ(stats.deallocation_count, deallocations);
+        CHECK(nanotest::stats_are_consistent(stats));
     };
 
     verify();
@@ -907,6 +909,183 @@ NANO_TEST(independent_pools_do_not_interact) {
     }
     CHECK(first.verify_integrity());
     CHECK(second.verify_integrity());
+}
+
+// ---------------------------------------------------------------------------
+// Budget and reservation accounting
+// ---------------------------------------------------------------------------
+
+NANO_TEST(budget_covers_heaps_spans_and_oversized_blocks) {
+    Pool pool({8 * kMiB});
+    const PoolStats fresh = pool.stats();
+    const std::size_t pool_object = fresh.system_reserved_bytes - fresh.capacity_bytes;
+    Rng rng(2024);
+    std::vector<Allocation> live;
+    std::uint64_t failures = 0;
+    bool consistent = true;
+    for (int step = 0; step < 4000; ++step) {
+        if (live.empty() || rng.chance(55)) {
+            // Mostly span blocks, some larger than a 1 MiB span can hold.
+            const std::size_t size = rng.chance(3) ? rng.between(kMiB + kMiB / 8, 5 * kMiB / 2)
+                                                   : rng.log_uniform(1, 256 * kKiB);
+            const std::size_t alignment = rng.chance(10) ? std::size_t{1} << rng.below(13) : 16;
+            void* ptr = pool.try_allocate(size, alignment);
+            if (ptr == nullptr) {
+                ++failures;
+                continue;
+            }
+            fill_pattern(ptr, std::min<std::size_t>(size, 4096), step);
+            live.push_back({ptr, size, static_cast<std::uint64_t>(step)});
+        } else {
+            const std::size_t victim = rng.below(live.size());
+            consistent = consistent && check_pattern(live[victim].ptr,
+                                                     std::min<std::size_t>(live[victim].size, 4096),
+                                                     live[victim].tag);
+            pool.deallocate(live[victim].ptr);
+            live[victim] = live.back();
+            live.pop_back();
+        }
+        if (step % 50 == 0) {
+            const PoolStats stats = pool.stats();
+            consistent = consistent && nanotest::stats_are_consistent(stats) &&
+                         stats.reserved_bytes <= stats.capacity_bytes &&
+                         stats.system_reserved_bytes ==
+                             stats.capacity_bytes + stats.oversized_reserved_bytes + pool_object;
+        }
+    }
+    CHECK(consistent);
+    CHECK(failures > 0);  // the budget was reached
+    CHECK_EQ(pool.stats().failed_allocation_count, failures);
+    for (const Allocation& allocation : live) {
+        pool.deallocate(allocation.ptr);
+    }
+    const PoolStats stats = pool.stats();
+    CHECK_EQ(stats.live_allocations, 0U);
+    CHECK_EQ(stats.oversized_reserved_bytes, 0U);
+    CHECK_EQ(stats.system_reserved_bytes, fresh.system_reserved_bytes);
+    CHECK_EQ(stats.reserved_bytes,
+             stats.metadata_bytes + stats.thread_free_bytes + stats.free_span_bytes);
+    CHECK(nanotest::stats_are_consistent(stats));
+    CHECK(pool.verify_integrity());
+}
+
+NANO_TEST(oversized_blocks_return_their_budget_when_released) {
+    Pool pool({16 * kMiB});
+    void* small = pool.allocate(100);  // the thread's heap and first span exist
+    const PoolStats before = pool.stats();
+    void* a = pool.allocate(3 * kMiB);
+    void* b = pool.allocate(2 * kMiB + 1, 4096);
+    CHECK(is_aligned(b, 4096));
+    PoolStats stats = pool.stats();
+    CHECK_EQ(stats.oversized_live_allocations, 2U);
+    CHECK_EQ(stats.oversized_live_bytes, pool.usable_size(a) + pool.usable_size(b));
+    CHECK(stats.oversized_reserved_bytes >= stats.oversized_live_bytes + 2 * Pool::header_size);
+    CHECK_EQ(stats.reserved_bytes, before.reserved_bytes + stats.oversized_reserved_bytes);
+    CHECK_EQ(stats.system_reserved_bytes,
+             before.system_reserved_bytes + stats.oversized_reserved_bytes);
+    CHECK_EQ(stats.live_consumed_bytes,
+             before.live_consumed_bytes + stats.oversized_reserved_bytes);
+    CHECK(nanotest::stats_are_consistent(stats));
+
+    pool.deallocate(a);
+    pool.deallocate(b);
+    stats = pool.stats();
+    CHECK_EQ(stats.oversized_live_allocations, 0U);
+    CHECK_EQ(stats.oversized_reserved_bytes, 0U);
+    CHECK_EQ(stats.reserved_bytes, before.reserved_bytes);
+    CHECK_EQ(stats.system_reserved_bytes, before.system_reserved_bytes);
+    CHECK_EQ(stats.oversized_allocation_count, 2U);
+    CHECK_EQ(stats.deallocation_count, 2U);
+
+    // Oversized blocks alone can use the whole unreserved budget, and no more.
+    std::vector<void*> blocks;
+    for (;;) {
+        void* ptr = pool.try_allocate(3 * kMiB);
+        if (ptr == nullptr) {
+            break;
+        }
+        blocks.push_back(ptr);
+        CHECK(pool.stats().reserved_bytes <= pool.capacity());
+    }
+    CHECK(blocks.size() >= 4);
+    CHECK(blocks.size() * 3 * kMiB <= pool.capacity() - before.reserved_bytes);
+    for (void* ptr : blocks) {
+        pool.deallocate(ptr);
+    }
+    pool.deallocate(small);
+    stats = pool.stats();
+    CHECK_EQ(stats.reserved_bytes, before.reserved_bytes);
+    CHECK_EQ(stats.live_allocations, 0U);
+    CHECK(nanotest::stats_are_consistent(stats));
+    CHECK(pool.verify_integrity());
+}
+
+NANO_TEST(carved_spans_stay_charged_against_the_budget) {
+    // Span blocks fill the budget; once spans are carved they stay charged
+    // (and owned by this thread) after their blocks are freed.
+    Pool pool({4 * kMiB});
+    std::vector<void*> blocks;
+    for (;;) {
+        void* ptr = pool.try_allocate(64 * kKiB);
+        if (ptr == nullptr) {
+            break;
+        }
+        blocks.push_back(ptr);
+    }
+    const PoolStats full = pool.stats();
+    CHECK(blocks.size() >= 50);
+    CHECK(full.reserved_bytes <= full.capacity_bytes);
+    CHECK(nanotest::stats_are_consistent(full));
+    CHECK(pool.try_allocate(2 * kMiB) == nullptr);  // more than the unreserved rest
+
+    for (void* ptr : blocks) {
+        pool.deallocate(ptr);
+    }
+    const PoolStats empty = pool.stats();
+    CHECK_EQ(empty.live_allocations, 0U);
+    CHECK_EQ(empty.reserved_bytes, full.reserved_bytes);
+    CHECK_EQ(empty.span_count, full.span_count);
+    CHECK_EQ(empty.free_span_count, 0U);  // this thread still owns them
+    CHECK_EQ(empty.reserved_bytes, empty.metadata_bytes + empty.thread_free_bytes);
+    CHECK(pool.try_allocate(2 * kMiB) == nullptr);
+    CHECK(nanotest::stats_are_consistent(empty));
+
+    // The thread's spans serve span requests again.
+    for (void*& ptr : blocks) {
+        ptr = pool.allocate(64 * kKiB);
+    }
+    CHECK_EQ(pool.stats().span_count, full.span_count);
+    for (void* ptr : blocks) {
+        pool.deallocate(ptr);
+    }
+    CHECK(pool.verify_integrity());
+}
+
+NANO_TEST(statistics_identities_hold_for_every_size_and_alignment) {
+    Pool pool({16 * kMiB});
+    std::vector<void*> live;
+    for (std::size_t size : boundary_sizes()) {
+        for (std::size_t alignment = 16; alignment <= Pool::max_alignment; alignment *= 4) {
+            live.push_back(pool.allocate(size, alignment));
+            if (!nanotest::stats_are_consistent(pool.stats())) {
+                CHECK(false);
+            }
+        }
+    }
+    PoolStats stats = pool.stats();
+    CHECK_EQ(stats.live_allocations, live.size());
+    for (std::size_t i = 0; i < live.size(); i += 2) {
+        pool.deallocate(live[i]);
+    }
+    CHECK(nanotest::stats_are_consistent(pool.stats()));
+    for (std::size_t i = 1; i < live.size(); i += 2) {
+        pool.deallocate(live[i]);
+    }
+    stats = pool.stats();
+    CHECK(nanotest::stats_are_consistent(stats));
+    CHECK_EQ(stats.live_allocations, 0U);
+    CHECK_EQ(stats.fragment_bytes, 0U);  // everything coalesced again
+    CHECK(pool.verify_integrity());
 }
 
 NANO_TEST(version_information_matches_build) {
