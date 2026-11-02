@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace {
 
@@ -54,9 +55,20 @@ int run(const char* scenario) {
         ptr[100] = 1;
         pool.deallocate(keep);
     } else if (std::strcmp(scenario, "asan_overflow_into_free_block") == 0) {
-        // Writing past usable_size() lands in a free (poisoned) buddy.
-        auto* ptr = static_cast<char*>(pool.allocate(64));
-        ptr[pool.usable_size(ptr)] = 1;
+        // Blocks are carved downwards: low_block is followed by victim's
+        // 16-byte header and then victim's (freed, poisoned) payload.
+        auto* keep = static_cast<char*>(pool.allocate(64));
+        auto* victim = static_cast<char*>(pool.allocate(64));
+        auto* low_block = static_cast<char*>(pool.allocate(64));
+        pool.deallocate(victim);
+        low_block[pool.usable_size(low_block) + 16] = 1;
+        pool.deallocate(low_block);
+        pool.deallocate(keep);
+    } else if (std::strcmp(scenario, "free_after_owner_exit") == 0) {
+        // Violates the thread lifetime contract: the owner has exited.
+        void* ptr = nullptr;
+        std::thread owner([&] { ptr = pool.allocate(64); });
+        owner.join();
         pool.deallocate(ptr);
     } else if (std::strcmp(scenario, "usable_size_after_free") == 0) {
         void* ptr = pool.allocate(100);

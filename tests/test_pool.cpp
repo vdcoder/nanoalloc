@@ -34,16 +34,18 @@ constexpr std::size_t kKiB = 1024;
 constexpr std::size_t kMiB = 1024 * 1024;
 constexpr std::size_t kSizeMax = std::numeric_limits<std::size_t>::max();
 
-#if defined(__SANITIZE_ADDRESS__)
-constexpr bool kAddressSanitizer = true;
+// AddressSanitizer and ThreadSanitizer report oversized system allocations as
+// errors instead of failing them.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr bool kSanitizedAllocator = true;
 #elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-constexpr bool kAddressSanitizer = true;
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+constexpr bool kSanitizedAllocator = true;
 #else
-constexpr bool kAddressSanitizer = false;
+constexpr bool kSanitizedAllocator = false;
 #endif
 #else
-constexpr bool kAddressSanitizer = false;
+constexpr bool kSanitizedAllocator = false;
 #endif
 
 struct Allocation {
@@ -125,17 +127,22 @@ NANO_TEST(fresh_pool_reports_consistent_statistics) {
     CHECK(stats.largest_free_block > 0);
     CHECK(stats.largest_free_block <= stats.capacity_bytes);
     CHECK(stats.metadata_bytes > 0);
-    CHECK(!stats.requested_bytes_tracked);  // opt-in
+    // Requested sizes are recorded in the block headers, so tracking is on by
+    // default and needs no side table.
+    CHECK(stats.requested_bytes_tracked);
     CHECK_EQ(stats.tracking_bytes, 0U);
     CHECK_EQ(stats.allocation_count, 0U);
     CHECK_EQ(stats.deallocation_count, 0U);
     CHECK_EQ(stats.failed_allocation_count, 0U);
     CHECK(pool.verify_integrity());
 
-    Pool with_tracking(tracked(1 * kMiB));
-    CHECK(with_tracking.stats().requested_bytes_tracked);
-    CHECK(with_tracking.stats().tracking_bytes > 0);
-    CHECK_EQ(with_tracking.stats().metadata_bytes, stats.metadata_bytes);
+    PoolConfig untracked_config;
+    untracked_config.capacity_bytes = 1 * kMiB;
+    untracked_config.track_requested_bytes = false;
+    Pool untracked(untracked_config);
+    CHECK(!untracked.stats().requested_bytes_tracked);
+    CHECK_EQ(untracked.stats().tracking_bytes, 0U);
+    CHECK_EQ(untracked.stats().metadata_bytes, stats.metadata_bytes);
 }
 
 NANO_TEST(invalid_configuration_is_rejected) {
@@ -147,10 +154,10 @@ NANO_TEST(invalid_configuration_is_rejected) {
 }
 
 NANO_TEST(unobtainable_arena_throws_bad_alloc) {
-    if constexpr (kAddressSanitizer) {
-        // ASan reports oversized system allocations as errors instead of
-        // failing them, so this case cannot be exercised under ASan.
-        std::printf("  skipped under AddressSanitizer\n");
+    if constexpr (kSanitizedAllocator) {
+        // The sanitizer runtimes report oversized system allocations as
+        // errors instead of failing them, so this case cannot be exercised.
+        std::printf("  skipped under a sanitizer allocator\n");
     } else if constexpr (sizeof(void*) < 8) {
         // On 32-bit targets max_capacity (1 GiB) can often be reserved.
         std::printf("  skipped on 32-bit targets\n");

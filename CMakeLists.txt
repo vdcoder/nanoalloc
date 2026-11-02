@@ -38,15 +38,22 @@ nanoalloc_enable_sanitizers()
 # ---------------------------------------------------------------------------
 # Library
 # ---------------------------------------------------------------------------
-add_library(nanoalloc
-    src/buddy_engine.cpp
-    src/buddy_engine.hpp
+find_package(Threads REQUIRED)
+
+set(NANOALLOC_SOURCES
+    src/block.hpp
     src/diagnostics.cpp
     src/diagnostics.hpp
+    src/heap.cpp
+    src/heap.hpp
     src/pool.cpp)
+add_library(nanoalloc ${NANOALLOC_SOURCES})
+list(TRANSFORM NANOALLOC_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/"
+     OUTPUT_VARIABLE NANOALLOC_SOURCES_ABSOLUTE)
 add_library(nanoalloc::nanoalloc ALIAS nanoalloc)
 
 target_compile_features(nanoalloc PUBLIC cxx_std_20)
+target_link_libraries(nanoalloc PUBLIC Threads::Threads)
 target_include_directories(nanoalloc
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
