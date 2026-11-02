@@ -3,7 +3,8 @@
 # Warnings for the library itself: strict, including implicit conversions.
 function(nanoalloc_apply_strict_warnings target)
     if(MSVC)
-        target_compile_options(${target} PRIVATE /W4 /permissive-)
+        # C4324: padding added by alignas(64) on purpose (cache-line isolation).
+        target_compile_options(${target} PRIVATE /W4 /permissive- /wd4324)
     else()
         target_compile_options(${target} PRIVATE
             -Wall -Wextra -Wpedantic
