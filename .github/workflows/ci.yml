@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.compiler }} ${{ matrix.build_type }}${{ matrix.sanitize && ' + sanitizers' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc, cxx: g++, build_type: Debug, sanitize: "" }
+          - { compiler: gcc, cxx: g++, build_type: Release, sanitize: "" }
+          - { compiler: clang, cxx: clang++, build_type: Debug, sanitize: "" }
+          - { compiler: clang, cxx: clang++, build_type: Release, sanitize: "" }
+          - { compiler: gcc, cxx: g++, build_type: Debug, sanitize: "address;undefined" }
+          - { compiler: clang, cxx: clang++, build_type: Debug, sanitize: "address;undefined" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        # libclang-rt-18-dev provides Clang's sanitizer runtimes.
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libclang-rt-18-dev
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DNANOALLOC_WARNINGS_AS_ERRORS=ON
+          "-DNANOALLOC_SANITIZE=${{ matrix.sanitize }}"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure --parallel 4
+      - name: Benchmark (quick)
+        if: matrix.build_type == 'Release' && matrix.sanitize == ''
+        run: ./build/benchmarks/nanoalloc_bench --quick
+
+  linux-shared:
+    name: Linux shared library + install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure, build and test
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+                -DNANOALLOC_WARNINGS_AS_ERRORS=ON -DCMAKE_INSTALL_PREFIX="$PWD/install"
+          cmake --build build --parallel
+          ctest --test-dir build --output-on-failure --parallel 4
+          cmake --install build
+
+  windows:
+    name: Windows MSVC ${{ matrix.config }}${{ matrix.sanitize && ' + ASan' || '' }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { config: Debug, sanitize: "" }
+          - { config: Release, sanitize: "" }
+          - { config: Debug, sanitize: "address" }
+    steps:
+      - uses: actions/checkout@v4
+      # Puts the MSVC tools, including the AddressSanitizer runtime DLLs, on PATH.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DNANOALLOC_WARNINGS_AS_ERRORS=ON
+          "-DNANOALLOC_SANITIZE=${{ matrix.sanitize }}"
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure --parallel 4
+      - name: Benchmark (quick)
+        if: matrix.config == 'Release'
+        run: .\build\benchmarks\Release\nanoalloc_bench.exe --quick
