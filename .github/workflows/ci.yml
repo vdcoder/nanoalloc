@@ -5,6 +5,21 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      compare_with:
+        description: >-
+          Paired benchmark: space-separated git refs (branches, tags or commits)
+          to compare this commit with. Empty: no comparison.
+        required: false
+        default: ""
+      compare_scale:
+        description: "Paired benchmark: trace scale (1.0 = nanoalloc_bench default)"
+        required: false
+        default: "1.0"
+      compare_iterations:
+        description: "Paired benchmark: alternating iterations per workload"
+        required: false
+        default: "15"
 
 permissions:
   contents: read
@@ -98,3 +113,71 @@ jobs:
         run: |
           .\build\benchmarks\Release\nanoalloc_bench.exe --quick
           .\build\benchmarks\Release\nanoalloc_mtbench.exe --quick
+
+  # Manually requested comparison with earlier versions (workflow_dispatch with
+  # compare_with). Each reference is built into nanoalloc_paired together with
+  # this commit; the two versions alternate iteration by iteration, which
+  # cancels most of the speed drift of shared runners.
+  paired-benchmark:
+    name: Paired benchmark ${{ matrix.os }}
+    if: github.event_name == 'workflow_dispatch' && inputs.compare_with != ''
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: current
+          fetch-depth: 0
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Build and compare
+        shell: bash
+        env:
+          REFERENCES: ${{ inputs.compare_with }}
+          SCALE: ${{ inputs.compare_scale }}
+          ITERATIONS: ${{ inputs.compare_iterations }}
+        run: |
+          set -euo pipefail
+          mkdir -p results
+          root="$PWD"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            root=$(cygpath -m "$PWD")  # a path native CMake understands
+          fi
+          for ref in $REFERENCES; do
+            commit=$(git -C current rev-parse --verify --quiet "$ref^{commit}" ||
+                     git -C current rev-parse --verify "origin/$ref^{commit}")
+            name=$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')
+            git -C current worktree add --detach "../reference-$name" "$commit"
+            cmake -S current -B "build-$name" -DCMAKE_BUILD_TYPE=Release \
+                  -DNANOALLOC_BUILD_TESTS=OFF -DNANOALLOC_BUILD_EXAMPLES=OFF \
+                  -DNANOALLOC_INSTALL=OFF "-DNANOALLOC_REFERENCE_SOURCE_DIR=$root/reference-$name"
+            cmake --build "build-$name" --config Release --target nanoalloc_paired --parallel
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              exe="build-$name/benchmarks/Release/nanoalloc_paired.exe"
+            else
+              exe="build-$name/benchmarks/nanoalloc_paired"
+            fi
+            echo "== current $(git -C current rev-parse --short HEAD) vs $ref ($commit)" |
+              tee "results/paired-$name.txt"
+            "$exe" --scale "$SCALE" --iterations "$ITERATIONS" | tee -a "results/paired-$name.txt"
+            last_build="build-$name"
+          done
+          # Absolute numbers of this commit against the system allocator.
+          cmake --build "$last_build" --config Release --target nanoalloc_bench --parallel
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            bench="$last_build/benchmarks/Release/nanoalloc_bench.exe"
+          else
+            bench="$last_build/benchmarks/nanoalloc_bench"
+          fi
+          "$bench" --allocators system,nanoalloc --scale "$SCALE" --csv results/bench.csv |
+            tee results/bench.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: paired-benchmark-${{ runner.os }}
+          path: results/
+

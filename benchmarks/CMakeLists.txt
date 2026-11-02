@@ -18,6 +18,46 @@ add_executable(nanoalloc_mtbench
 target_link_libraries(nanoalloc_mtbench PRIVATE nanoalloc::nanoalloc Threads::Threads)
 nanoalloc_apply_warnings(nanoalloc_mtbench)
 
+# Optional: paired comparison with another nanoalloc source tree (for example
+# a worktree of an earlier commit), both versions built into one executable.
+set(NANOALLOC_REFERENCE_SOURCE_DIR "" CACHE PATH
+    "Another nanoalloc source tree to compare with; builds nanoalloc_paired")
+set(_nanobench_targets nanoalloc_bench nanoalloc_mtbench)
+if(NANOALLOC_REFERENCE_SOURCE_DIR)
+    set(_nanobench_reference "${NANOALLOC_REFERENCE_SOURCE_DIR}")
+    file(GLOB _nanobench_reference_sources CONFIGURE_DEPENDS "${_nanobench_reference}/src/*.cpp")
+    if(NOT _nanobench_reference_sources OR
+       NOT EXISTS "${_nanobench_reference}/include/nanoalloc/pool.hpp")
+        message(FATAL_ERROR "NANOALLOC_REFERENCE_SOURCE_DIR is not a nanoalloc source tree: "
+                            "${_nanobench_reference}")
+    endif()
+    # The reference is compiled with its namespace renamed, so that both
+    # versions can live in one program.
+    add_library(nanoalloc_reference OBJECT ${_nanobench_reference_sources})
+    target_include_directories(nanoalloc_reference PRIVATE
+        "${_nanobench_reference}/include" "${_nanobench_reference}/src")
+    target_compile_features(nanoalloc_reference PRIVATE cxx_std_20)
+    target_compile_definitions(nanoalloc_reference PRIVATE nanoalloc=nanoalloc_reference)
+
+    # The current version is compiled from source as well, with the same flags.
+    add_executable(nanoalloc_paired
+        paired.cpp
+        platform.cpp
+        platform.hpp
+        workloads.cpp
+        workloads.hpp
+        ${NANOALLOC_SOURCES_ABSOLUTE}
+        $<TARGET_OBJECTS:nanoalloc_reference>)
+    target_include_directories(nanoalloc_paired PRIVATE
+        ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(nanoalloc_paired PRIVATE cxx_std_20)
+    target_compile_definitions(nanoalloc_paired PRIVATE
+        NANOALLOC_REFERENCE_POOL_HEADER="${_nanobench_reference}/include/nanoalloc/pool.hpp")
+    target_link_libraries(nanoalloc_paired PRIVATE Threads::Threads)
+    nanoalloc_apply_warnings(nanoalloc_paired)
+    list(APPEND _nanobench_targets nanoalloc_paired)
+endif()
+
 # Record how the benchmark was built so that reports can state it.
 # Flags are embedded verbatim in raw string literals, so quotes, backslashes
 # and other characters in them need no escaping. Only the configuration name
@@ -36,7 +76,7 @@ file(CONFIGURE OUTPUT ${_nanobench_generated}/nanobench_build_flags.hpp @ONLY CO
 file(GENERATE
     OUTPUT ${_nanobench_generated}/$<CONFIG>/nanobench_build_type.hpp
     CONTENT "#pragma once\n#define NANOBENCH_BUILD_TYPE \"$<CONFIG>\"\n")
-foreach(_target nanoalloc_bench nanoalloc_mtbench)
+foreach(_target IN LISTS _nanobench_targets)
     target_include_directories(${_target} PRIVATE
         ${_nanobench_generated}
         ${_nanobench_generated}/$<CONFIG>)
