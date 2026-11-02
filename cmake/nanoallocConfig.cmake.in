@@ -1,4 +1,8 @@
 @PACKAGE_INIT@
 
+# nanoalloc::nanoalloc links Threads::Threads publicly (thread-local heaps).
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
 include("${CMAKE_CURRENT_LIST_DIR}/nanoallocTargets.cmake")
 check_required_components(nanoalloc)

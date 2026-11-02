@@ -82,6 +82,11 @@ jobs:
           cmake --build build --parallel
           ctest --test-dir build --output-on-failure --parallel 4
           cmake --install build
+      - name: Use the installed package
+        run: |
+          cmake -S tests/package -B build-package -G Ninja -DCMAKE_PREFIX_PATH="$PWD/install"
+          cmake --build build-package
+          LD_LIBRARY_PATH="$PWD/install/lib:$PWD/install/lib64" ./build-package/nanoalloc_package_test
 
   windows:
     name: Windows MSVC ${{ matrix.config }}${{ matrix.sanitize && ' + ASan' || '' }}

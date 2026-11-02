@@ -385,44 +385,56 @@ bound otherwise. They never decrease.
 
 ## Performance
 
-Two benchmark programs use only the public API:
+Benchmark programs use only the public API:
 
 - `nanoalloc_bench`: nine deterministic single-thread traces (small, medium
   and mixed objects, LIFO, random, bursts, long- and short-lived objects,
-  fragmentation, reuse) against the system allocator, reporting
-  allocation/deallocation throughput and memory (usable, consumed and
-  reserved bytes, slack, metadata). `--help` lists options.
+  fragmentation, reuse) against the system allocator. It reports
+  allocation and deallocation throughput with their spread, and, from a
+  separate untimed replay, memory (usable, consumed and reserved bytes,
+  slack, metadata). Every replay must reproduce a checksum computed from the
+  trace, and the allocator order rotates between iterations.
 - `nanoalloc_mtbench`: 1-16 threads with 0-100% cross-thread frees, and a
-  many-to-one inbox scenario with explicit draining.
+  many-to-one inbox scenario. Deallocation is reported both as issued
+  (`free`) and as completed, including the owner's drain (`done`).
+- `nanoalloc_paired` (built when `NANOALLOC_REFERENCE_SOURCE_DIR` names
+  another nanoalloc source tree): runs this version and the other one in
+  the same process, alternating every iteration, and reports time ratios.
+  This resolves differences of a few percent on machines whose speed drifts
+  much more between runs.
 
 ```bash
 ./build/release/benchmarks/nanoalloc_bench
 ./build/release/benchmarks/nanoalloc_mtbench
 ```
 
-Measured on a 4-vCPU Intel Xeon (Cascade Lake) virtual machine with GCC 13.3
-`-O3`, against glibc 2.39 and the previous buddy allocator; full tables,
-method and the optimization history are in
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md):
+Single-thread throughput against glibc 2.39 on a 4-vCPU Intel Xeon (Cascade
+Lake) virtual machine, GCC 13.3 `-O3` (median of three runs), and the time
+ratio against the previous buddy allocator measured in the same process
+(below 1 is faster; Zen 3 numbers from GitHub-hosted runners). The full
+tables, method, profiles and the optimization history are in
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
-| Workload | combined Mops/s glibc | buddy (0.1) | nanoalloc | slack B/alloc glibc | buddy | nanoalloc |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| small | 67.4 | 49.0 | 64.8 | 7.5 | 18.2 | 7.5 |
-| medium | 25.3 | 14.4 | 29.6 | 8.5 | 396.8 | 7.5 |
-| mixed | 35.1 | 26.8 | 43.4 | 8.1 | 261.0 | 7.5 |
-| lifo | 14.4 | 14.0 | 29.6 | 7.5 | 83.5 | 7.5 |
-| random | 27.9 | 20.2 | 37.0 | 8.1 | 144.7 | 7.5 |
-| bursts | 51.7 | 33.9 | 66.8 | 7.6 | 29.5 | 7.5 |
-| long_short | 61.2 | 27.3 | 36.3 | 7.6 | 55.4 | 7.5 |
-| fragmentation | 29.7 | 22.9 | 42.5 | 7.7 | 43.8 | 7.5 |
-| reuse | 117.1 | 56.9 | 49.9 | 7.1 | 16.0 | 7.5 |
+| Workload | combined Mops/s glibc | nanoalloc | time vs buddy, Intel GCC | Zen 3 GCC | Zen 3 MSVC | slack B/alloc buddy | nanoalloc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| small | 63.1 | 61.6 | 0.87 | 0.93 | 0.94 | 18.2 | 7.5 |
+| medium | 24.6 | 29.6 | 0.90 | 1.15 | 1.14 | 396.8 | 7.5 |
+| mixed | 30.6 | 41.7 | 0.78 | 0.92 | 0.98 | 261.0 | 7.5 |
+| lifo | 17.1 | 47.8 | 0.38 | 0.47 | 0.53 | 83.5 | 7.5 |
+| random | 27.0 | 42.5 | 0.68 | 0.87 | 0.93 | 144.7 | 7.5 |
+| bursts | 62.1 | 68.7 | 0.50 | 0.61 | 0.72 | 29.5 | 7.5 |
+| long_short | 65.5 | 41.1 | 1.03 | 1.03 | 1.11 | 55.4 | 7.5 |
+| fragmentation | 29.2 | 43.2 | 0.92 | 0.99 | 1.06 | 43.8 | 7.5 |
+| reuse | 95.1 | 52.3 | 1.01 | 1.11 | 1.20 | 16.0 | 7.5 |
 
-With four threads, aggregate combined throughput was 73 vs 47 Mops/s
-(glibc) without cross-thread frees and 39 vs 9 Mops/s with 50% of blocks
-freed by another thread. These results come from one virtual machine and a
-specific set of workloads; glibc is faster on workloads that repeatedly
-allocate and free the same sizes (`reuse`, `long_short`), where it reuses
-cached chunks while nanoalloc splits and merges blocks every time.
+With four threads, aggregate combined throughput was 141 vs 76 Mops/s
+(glibc) without cross-thread frees and 45 vs 18 Mops/s with 25% of blocks
+freed by another thread. These results come from shared virtual machines
+and a specific set of workloads, and the ranking depends on the CPU. glibc
+is faster on workloads that repeatedly allocate and free the same sizes
+(`reuse`, `long_short`), where it reuses cached chunks while nanoalloc
+splits and merges blocks every time; the buddy allocator, with
+power-of-two classes, is faster there on some CPUs.
 
 ## Testing
 
@@ -473,9 +485,9 @@ safety; under TSan `test_no_heap` is not built because it replaces the global
 include/nanoalloc/   public headers
 src/                 pool, thread heaps (heap.*), block format (block.hpp)
 tests/               contract, stress, thread, engine and misuse tests
-benchmarks/          nanoalloc_bench, nanoalloc_mtbench
+benchmarks/          nanoalloc_bench, nanoalloc_mtbench, nanoalloc_paired, compare_builds.py
 examples/            runnable usage examples
-docs/                performance log
+docs/                performance log, review follow-up report
 ```
 
 ## License
