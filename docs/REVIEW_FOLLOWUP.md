@@ -78,6 +78,10 @@ All statistics tests also check the documented identities
 
 ## 2. Thread lifetime contract
 
+> Superseded: allocations may now outlive their thread, and frees after the
+> owner's exit are accepted (see [THREAD_RETIREMENT.md](THREAD_RETIREMENT.md)).
+> This section describes the contract as it was at the time of the review.
+
 The contract, now worded the same way in `pool.hpp`, the
 `MemoryResource` and `Allocator` documentation, and the README:
 

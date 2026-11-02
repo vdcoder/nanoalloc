@@ -107,9 +107,9 @@ struct TlsSlot {
 struct ThreadState {
     std::uint64_t thread_id;
     TlsSlot slots[kTlsSlots];
-    // Set when the thread-exit hook has run: the thread's heaps are retired
-    // and its later calls (from thread_local destructors) may not allocate
-    // and free through the owners' inboxes.
+    // Set when the thread-exit hook has run: the thread's heaps have been
+    // handed over. Its later calls (from thread_local destructors) may not
+    // allocate; their frees go through the owners' inboxes.
     bool exiting;
 };
 

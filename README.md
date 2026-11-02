@@ -20,7 +20,8 @@ many threads, with no more than 15 bytes of unused payload per allocation.**
 ## Features
 
 - `nanoalloc::Pool`: a capacity-bounded memory pool. Each thread allocates
-  from its own spans without locks; any thread may free any block.
+  from its own spans without locks; any thread may free any block, also after
+  the thread that allocated it has exited.
 - **16-byte granularity**: a request of `n` bytes gets exactly `n` rounded up
   to a multiple of 16 usable bytes (at most 15 bytes of slack), 16-byte
   aligned, plus a 16-byte header. Power-of-two alignments up to 4096 bytes are
@@ -35,9 +36,8 @@ many threads, with no more than 15 bytes of unused payload per allocation.**
   `nanoalloc::Allocator<T>` (standard C++20 allocator) adapters.
 - Exact statistics of requested, usable and consumed bytes, headers, spans,
   pending remote frees, splits and merges, from per-thread counters.
-- Misuse detection (foreign, misaligned and interior pointers, double frees,
-  frees after the owning thread exited) and AddressSanitizer poisoning of free
-  memory.
+- Misuse detection (foreign, misaligned and interior pointers, double frees)
+  and AddressSanitizer poisoning of free memory.
 - No third-party dependencies.
 
 ## Supported platforms
@@ -183,29 +183,33 @@ merges it with its neighbours) at its next allocation or deallocation in that
 pool, or when it calls `pool.drain_pending_frees()`. Until then the block
 still counts as live memory (`PoolStats::pending_remote_frees`). A thread that
 frees memory for others but rarely allocates itself can call
-`drain_pending_frees()` to return memory promptly. There is no background
-thread or timer.
+`drain_pending_frees()` to return memory promptly. Running threads get no
+background processing; only the heaps of exited threads do (below).
 
-**Thread lifetime contract.** The thread that allocates a block owns it. All
-cross-thread accesses to a block, and its deallocation by another thread,
-must complete before the owner begins to terminate. "Complete" means ordered
-by synchronization the program has anyway: for example, the threads that use
-the block are joined, or signal the owner, before the owner's thread function
-returns. The owner itself may use its blocks until it has finished
-terminating.
+**Allocations outlive their thread.** A block stays valid until it is
+deallocated or the pool is destroyed, whether or not the thread that
+allocated it is still running. Any thread may read, write and deallocate it,
+with the synchronization any shared object needs.
 
 When a thread that used the pool terminates (as its `thread_local` objects are
-destroyed), the pool releases the frees waiting in its inbox and returns its
-completely free spans to the pool for other threads. Then:
+destroyed), the pool releases the frees waiting in the thread's heap and
+returns its completely free spans to the pool. Then:
 
-- Blocks the thread still owns stay allocated until the pool is destroyed,
-  and so do the spans that hold them. Other threads must not touch them; a
-  free from another thread is detected and reported as a fatal error.
-- `thread_local` destructors of the terminating thread that run later may
-  still use the pool: they may free the thread's own blocks (spans that become
-  free go back to the pool) and allocate. These late calls take the pool lock.
-- A thread heap that holds no span is reused by the next new thread, together
-  with its statistics.
+- A heap that still holds allocated blocks is **retired**: handed to a
+  process-wide reclamation worker (one background thread, started the first
+  time a heap is retired). Frees of its blocks, from any thread, go to its
+  inbox like other cross-thread frees. The worker processes them
+  asynchronously: it polls every 1 ms while it finds work and backs off to
+  every 50 ms when idle, so memory freed into a retired heap is reclaimed
+  within about 50 ms. Spans that become empty go back to the pool for other
+  threads, and a heap that holds nothing becomes reusable.
+  `PoolStats::retired_thread_heap_count` counts the retired heaps.
+- **No allocation after retirement.** In `thread_local` destructors that run
+  after this point, `allocate()` throws `std::bad_alloc` and `try_allocate()`
+  returns `nullptr`, for every pool; the thread gets no new heap. Its
+  deallocations are accepted and go through the owners' inboxes.
+- A heap that holds no block is reused by the next new thread, together with
+  its statistics.
 
 ## How it works
 
@@ -260,6 +264,17 @@ with one atomic exchange and frees the blocks normally.
 1 MiB - 80 bytes, or a smaller request with a large alignment) are served by
 the system allocator with the same 16-byte header in front, are charged
 against the pool's budget, and are released by `deallocate()` as usual.
+
+**Retirement.** A thread's exit hook (a `thread_local` object) finishes the
+thread's own work on its heap under the pool lock, then clears the thread's
+cached heap pointers, so later calls of that thread find no heap. A heap with
+live blocks is then linked into the reclamation worker's list under the
+worker's mutex, which orders everything the owner did before anything the
+worker does. Remote frees need no change: they always push to the owner's
+inbox, whether the owner runs or not. The worker drains retired inboxes with
+the normal release-and-coalesce path, and a heap is reusable only when it
+has no span left, i.e. no allocated or pending block that a freeing thread
+could still be working on. See [docs/THREAD_RETIREMENT.md](docs/THREAD_RETIREMENT.md).
 
 ## Guarantees
 
@@ -351,7 +366,7 @@ where each reserved byte is:
 | `span_count` / `span_bytes` | all spans carved from the arena |
 | `oversized_live_allocations` / `oversized_live_bytes` / `oversized_reserved_bytes` | live oversized blocks: count, payload and system bytes |
 | `pending_remote_frees` | blocks freed by another thread and still waiting in their owner's inbox (they count as live) |
-| `thread_heap_count` / `active_thread_heap_count` | thread heaps carved, and those owned by a running thread |
+| `thread_heap_count` / `active_thread_heap_count` / `retired_thread_heap_count` | thread heaps carved; those owned by a running thread; those of exited threads that still hold blocks (managed by the reclamation worker) |
 | `free_bytes` | `capacity_bytes - live_consumed_bytes`: a utilization figure, not memory the caller can allocate |
 | `largest_free_block` | the largest request the calling thread is guaranteed to get from a span now |
 
@@ -444,11 +459,12 @@ power-of-two classes, is faster there on some CPUs.
 | --- | --- | --- |
 | Public contract | `contract` | alignment (1-4096), boundary sizes, zero-byte and null cases, read/write of the whole usable range, non-overlap, content integrity, exhaustion and recovery, large and oversized objects, statistics against a model, pmr and Allocator with standard containers, no system allocation during operations (`test_no_heap`) |
 | Stress | `stress` | deterministic randomized runs (8 scenarios x 4 seeds) verifying data patterns, non-overlap, statistics and `verify_integrity()` throughout; `NANOALLOC_STRESS_SEED`/`NANOALLOC_STRESS_SCALE` reproduce or extend a run |
-| Threads | `threads` | cross-thread frees, many threads freeing into one owner, explicit and implicit draining, concurrent frees while the owner allocates and drains, all-to-all exchange, sharing blocks while their owner runs, span reuse after thread exit, statistics across heap reuse and thread churn (with concurrent remote frees), pool use from `thread_local` destructors, concurrent statistics |
+| Threads | `threads` | cross-thread frees, many threads freeing into one owner, explicit and implicit draining, concurrent frees while the owner allocates and drains, all-to-all exchange, blocks shared during and after their owner's life, span reuse after thread exit, statistics across heap reuse and thread churn (with concurrent remote frees), concurrent statistics |
+| Retirement | `threads` | blocks freed after their thread exited, concurrent frees into several retired heaps, the last free racing the worker, `thread_local` destructors that free and that try to allocate after retirement, span and heap reuse, 2000 short-lived threads with bounded heaps and spans, pool destruction during reclamation, statistics, randomized exit and free timing (`test_retirement`) |
 | Engine | `engine` | exact 16-byte rounding, header accounting, bucket layout, splitting at every small remainder, 16-byte fragments, immediate and multilevel coalescing, bitmap transitions, coarse-bucket search, span acquisition and boundaries, oversized allocations, several pools per thread, randomized fragmentation with full validation |
-| Misuse | `misuse` | double frees, foreign, misaligned and interior pointers, other pool, free after the owner exited; under ASan, use-after-free and overflow into free memory |
+| Misuse | `misuse` | double frees, foreign, misaligned and interior pointers, other pool; under ASan, use-after-free and overflow into free memory |
 
-Contract, stress and thread tests use only the public API. Run the
+Contract, stress, thread and retirement tests use only the public API. Run the
 `sanitize` (ASan + UBSan) and `tsan` presets to check memory and thread
 safety; under TSan `test_no_heap` is not built because it replaces the global
 `operator new`, which the TSan runtime also defines.
@@ -459,10 +475,11 @@ safety; under TSan `test_no_heap` is not built because it replaces the global
   it exits, even when they are empty, so reserved memory grows with the number
   of threads (about one or more 1 MiB spans per thread). Memory is never
   returned to the operating system while the pool lives.
-- **Thread lifetime contract** (see [Threads](#threads)): other threads must
-  finish using and freeing a thread's blocks before it begins to exit. Blocks
-  a thread leaves allocated when it exits, and the spans holding them, stay
-  reserved until the pool is destroyed.
+- **Retired heaps.** Blocks a thread leaves allocated when it exits keep their
+  spans (and their heap) until they are freed; memory freed into a retired
+  heap is reclaimed asynchronously, within about 50 ms. A thread may not
+  allocate from `thread_local` destructors that run after its exit has been
+  processed (see [Threads](#threads)).
 - **Carved spans stay charged.** Spans are never returned to the budget while
   the pool lives (free ones are reused by other threads), so a pool whose
   arena has been carved into spans cannot serve oversized requests any more.
@@ -487,7 +504,7 @@ src/                 pool, thread heaps (heap.*), block format (block.hpp)
 tests/               contract, stress, thread, engine and misuse tests
 benchmarks/          nanoalloc_bench, nanoalloc_mtbench, nanoalloc_paired, compare_builds.py
 examples/            runnable usage examples
-docs/                performance log, review follow-up report
+docs/                performance log, review follow-up report, thread retirement
 ```
 
 ## License

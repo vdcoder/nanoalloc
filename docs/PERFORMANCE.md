@@ -320,6 +320,17 @@ on Zen 4 the same build is 3% faster), and `small` with MSVC is within
 noise. The gaps to the buddy allocator listed above remain on the AMD
 runners.
 
+## Thread retirement (allocations outliving their thread)
+
+Paired comparison with the commit before the feature (`9faf541`), five
+processes, full-scale traces, local machine; time ratio after / before:
+combined 0.985-1.038 on the nine workloads, every range across processes
+includes 1, and the noise floor of a self-comparison is 0.96-1.01 (`lifo`
+0.87-1.10). The allocation and deallocation fast paths are unchanged. The
+multithreaded benchmark showed overlapping distributions (4 threads,
+10 alternating runs per build). Details and reclamation measurements are in
+[THREAD_RETIREMENT.md](THREAD_RETIREMENT.md).
+
 ## Optimization log (initial implementation)
 
 Instruction counts are per allocate+free pair in the timed replay at scale
