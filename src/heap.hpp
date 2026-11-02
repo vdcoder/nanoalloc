@@ -277,6 +277,10 @@ private:
                  std::size_t payload) noexcept;
     /// Allocation path that has to search the bitmap and split a block.
     void* allocate_split(std::size_t requested, std::size_t payload) noexcept;
+    /// Common case of allocate_split(): a request of at most kExactLimit
+    /// bytes whose exact bucket is empty, with an empty inbox. Splits the head
+    /// of the smallest non-empty larger bucket.
+    void* allocate_larger(std::size_t requested, std::size_t payload, unsigned bucket) noexcept;
     bool grow(std::size_t need) noexcept;
     void add_span(Span* span) noexcept;
     void release(Block* block, std::uint64_t word1) noexcept;
@@ -430,6 +434,7 @@ inline void* ThreadHeap::allocate(std::size_t requested, std::size_t payload) no
             }
             return finish(block, need, prev_field(load_word(block->word1)), requested, payload);
         }
+        return allocate_larger(requested, payload, bucket);
     }
     return allocate_split(requested, payload);
 }

@@ -47,6 +47,43 @@ void* ThreadHeap::allocate_split(std::size_t requested, std::size_t payload) noe
     return finish(block, need, rest, requested, payload);
 }
 
+void* ThreadHeap::allocate_larger(std::size_t requested, std::size_t payload,
+                                  unsigned bucket) noexcept {
+    // The same block allocate_split() would choose (the exact bucket is empty,
+    // so the best fit is the head of the next non-empty bucket), without its
+    // general cases: every block from bucket + 1 on is larger than `need`, so
+    // there is always a remainder (16 bytes or more), and the block is the
+    // head of its list.
+    const unsigned found = find_nonempty(bucket + 1);
+    if (found == kBucketCount) [[unlikely]] {
+        return allocate_split(requested, payload);  // acquires a span
+    }
+    const std::size_t need = payload + kHeaderSize;
+    Block* free_block = heads_[found];
+    const std::uint64_t free_word1 = load_word(free_block->word1);
+    const std::size_t rest = size_field(free_word1) - need;
+    if (rest < kBucketBounds.min[found]) {
+        // The remainder leaves this bucket: pop the head, then file the
+        // remainder under its own size (or keep it as a 16-byte fragment).
+        Block* next = link_next(free_block);
+        heads_[found] = next;
+        if (next == nullptr) {
+            mark_empty(found);
+        }
+        if (rest >= kMinFreeBlock) {
+            push_free(free_block, bucket_index(rest));
+        } else {
+            counters_.fragment_bytes.add(kHeaderSize);
+        }
+    }
+    store_word(free_block->word1, (free_word1 & ~kSizeMask) | rest);
+    Block* block = block_after(free_block, rest);
+    unpoison_memory(block, kHeaderSize);
+    set_following_prev(block, need);
+    counters_.splits.add(1);
+    return finish(block, need, rest, requested, payload);
+}
+
 void* ThreadHeap::allocate_aligned(std::size_t requested, std::size_t payload,
                                    std::size_t alignment) noexcept {
     drain_pending();
