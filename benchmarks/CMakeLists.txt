@@ -48,6 +48,7 @@ if(BUILD_TESTING)
         COMMAND nanoalloc_bench --scale 0.02 --iterations 1 --warmup 0)
     set_tests_properties(benchmark.smoke PROPERTIES LABELS "benchmark" TIMEOUT 600)
     add_test(NAME benchmark.mt_smoke
-        COMMAND nanoalloc_mtbench --threads 1,2 --remote 0,50 --objects 2000 --rounds 1)
+        COMMAND nanoalloc_mtbench --threads 1,2 --remote 0,50 --objects 2000 --rounds 1
+                --repeats 1)
     set_tests_properties(benchmark.mt_smoke PROPERTIES LABELS "benchmark" TIMEOUT 600)
 endif()

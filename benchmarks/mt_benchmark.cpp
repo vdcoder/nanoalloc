@@ -7,16 +7,20 @@
 // Scenarios
 // ---------
 // exchange     Every round, each thread allocates N objects (allocation
-//              phase), then all threads deallocate (deallocation phase). A
-//              precomputed share of the objects (0-100%) is deallocated by a
-//              different thread than the one that allocated it. Blocks are
-//              reused round after round; nanoalloc owners drain their inbox in
-//              the next allocation phase, so draining is part of the measured
-//              allocation work.
+//              phase), then all threads deallocate (deallocation phase), then
+//              every thread reclaims what others freed for it (drain phase:
+//              drain_pending_frees() for nanoalloc, nothing for the system
+//              allocator). A precomputed share of the objects (0-100%) is
+//              deallocated by a different thread than the one that allocated
+//              it. Blocks are reused round after round.
 // many-to-one  Thread 0 allocates N objects for each other thread; all other
 //              threads deallocate them concurrently into thread 0's inbox;
-//              thread 0 then drains its inbox explicitly
-//              (drain_pending_frees()), which is timed separately.
+//              thread 0 then drains its inbox (drain_pending_frees()).
+//
+// Deallocation throughput is reported twice: "free" counts only the
+// deallocate() calls (for a remote free that is handing the block to its
+// owner), "done" also includes the drain phase, after which every block is
+// reusable again. Combined throughput includes all three phases.
 //
 // Method
 // ------
@@ -25,8 +29,15 @@
 // * Phases are separated by a spinning barrier. Each thread times only its own
 //   work in a phase; a phase's throughput is its total operations divided by
 //   the longest per-thread time, so barrier wake-up skew is not counted.
-// * Each allocation writes an 8-byte stamp; each deallocation reads it.
-// * 2 warmup rounds, then the median of the measured rounds is reported.
+// * Each allocation writes a stamp; each deallocation reads it. The sum each
+//   thread reads in a round is compared with the value computed from the
+//   trace; a mismatch (a block overwritten or handed out twice) stops the
+//   benchmark with an error.
+// * Each configuration is run `repeats` times per allocator, in rotating
+//   allocator order; each run has 2 warmup rounds. Medians over all measured
+//   rounds are reported, with the median absolute deviation as "noise".
+// * Only thread-safe allocators are compared: every allocator here is shared
+//   by all threads and supports cross-thread frees.
 // * Thread lifetime contract: worker threads live for the whole run of a
 //   configuration and only exit after every cross-thread deallocation has
 //   completed (final barrier).
@@ -62,6 +73,7 @@ struct Options {
     std::size_t objects = 20000;  // per thread per round
     unsigned rounds = 9;
     unsigned warmup = 2;
+    unsigned repeats = 2;  // runs per allocator and configuration
     std::uint64_t seed = 0x6D74626EULL;
     bool many_to_one = true;
     std::vector<std::string> allocators = {"system", "nanoalloc"};
@@ -87,8 +99,9 @@ void print_usage() {
         "  --threads LIST     thread counts (default 1,2,4,8,16 up to the CPU count)\n"
         "  --remote LIST      cross-thread deallocation percentages (default 0,10,25,50,100)\n"
         "  --objects N        objects per thread per round (default 20000)\n"
-        "  --rounds N         measured rounds (default 9)\n"
-        "  --quick            --objects 5000 --rounds 3\n"
+        "  --rounds N         measured rounds per run (default 9)\n"
+        "  --repeats N        runs per allocator, in rotating order (default 2)\n"
+        "  --quick            --objects 5000 --rounds 3 --repeats 1\n"
         "  --allocators LIST  subset of system,nanoalloc\n"
         "  --no-many-to-one   skip the many-to-one scenario\n");
 }
@@ -113,9 +126,12 @@ Options parse_options(int argc, char** argv) {
             options.objects = parse_unsigned_list(value()).at(0);
         } else if (arg == "--rounds") {
             options.rounds = parse_unsigned_list(value()).at(0);
+        } else if (arg == "--repeats") {
+            options.repeats = parse_unsigned_list(value()).at(0);
         } else if (arg == "--quick") {
             options.objects = 5000;
             options.rounds = 3;
+            options.repeats = 1;
         } else if (arg == "--allocators") {
             std::stringstream stream(value());
             std::string item;
@@ -153,8 +169,9 @@ Options parse_options(int argc, char** argv) {
             throw std::invalid_argument("remote percentages must be in 0..100");
         }
     }
-    if (options.objects == 0 || options.objects > 10'000'000 || options.rounds == 0) {
-        throw std::invalid_argument("objects and rounds must be positive");
+    if (options.objects == 0 || options.objects > 10'000'000 || options.rounds == 0 ||
+        options.repeats == 0 || options.rounds > 10000 || options.repeats > 1000) {
+        throw std::invalid_argument("objects, rounds and repeats must be positive (and bounded)");
     }
     return options;
 }
@@ -256,23 +273,42 @@ double median(std::vector<double> values) {
     return n % 2 == 1 ? values[n / 2] : 0.5 * (values[n / 2 - 1] + values[n / 2]);
 }
 
+/// Median absolute deviation relative to the median, in percent.
+double noise_percent(const std::vector<double>& values) {
+    const double center = median(values);
+    std::vector<double> deviations;
+    for (double value : values) {
+        deviations.push_back(value > center ? value - center : center - value);
+    }
+    return center > 0 ? 100.0 * median(deviations) / center : 0.0;
+}
+
 double elapsed_ns(Clock::time_point start, Clock::time_point end) {
     return std::chrono::duration<double, std::nano>(end - start).count();
 }
 
+double rate(double operations, double ns) { return ns > 0 ? operations / ns * 1e3 : 0.0; }
+
+double max_of(const std::vector<double>& values) {
+    return *std::max_element(values.begin(), values.end());
+}
+
 std::atomic<std::uint64_t> g_checksum{0};
+std::atomic<std::uint64_t> g_checksum_errors{0};
 
 // ---- exchange scenario ------------------------------------------------------
 
-struct ExchangeResult {
-    double alloc_mops = 0;
-    double free_mops = 0;
-    double combined_mops = 0;
-    std::size_t reserved = 0;
+/// Per measured round, appended by every run of one allocator.
+struct ExchangeRounds {
+    std::vector<double> alloc;      // Mops/s
+    std::vector<double> free;       // deallocate() calls, Mops/s
+    std::vector<double> done;       // deallocate() calls plus draining, Mops/s
+    std::vector<double> combined;   // all operations / all three phases
+    std::size_t reserved = 0;       // nanoalloc reserved bytes after the last run
 };
 
-ExchangeResult run_exchange(Backend& backend, unsigned threads, unsigned remote_percent,
-                            const Options& options) {
+void run_exchange(Backend& backend, unsigned threads, unsigned remote_percent,
+                  const Options& options, ExchangeRounds& out) {
     const std::size_t objects = options.objects;
     // Precomputed trace: sizes per producer and the list of (producer, index)
     // each thread deallocates.
@@ -289,9 +325,14 @@ ExchangeResult run_exchange(Backend& backend, unsigned threads, unsigned remote_
             frees[freer].emplace_back(t, static_cast<std::uint32_t>(i));
         }
     }
-    for (auto& list : frees) {  // interleave producers within each freer's list
+    std::vector<std::uint64_t> expected(threads, 0);  // stamps each thread reads per round
+    for (unsigned t = 0; t < threads; ++t) {
+        auto& list = frees[t];  // interleave producers within each freer's list
         for (std::size_t i = list.size(); i > 1; --i) {
             std::swap(list[i - 1], list[static_cast<std::size_t>(rng.below(i))]);
+        }
+        for (const auto& entry : list) {
+            expected[t] += entry.second;
         }
     }
     std::vector<std::vector<void*>> slots(threads, std::vector<void*>(objects, nullptr));
@@ -299,10 +340,11 @@ ExchangeResult run_exchange(Backend& backend, unsigned threads, unsigned remote_
     const unsigned total_rounds = options.warmup + options.rounds;
     std::vector<std::vector<double>> alloc_ns(total_rounds, std::vector<double>(threads));
     std::vector<std::vector<double>> free_ns(total_rounds, std::vector<double>(threads));
+    std::vector<std::vector<double>> drain_ns(total_rounds, std::vector<double>(threads));
     SpinBarrier barrier(threads);
 
     auto worker = [&](unsigned t) {
-        std::uint64_t sum = 0;
+        std::uint64_t total = 0;
         for (unsigned round = 0; round < total_rounds; ++round) {
             barrier.arrive_and_wait();
             const Clock::time_point a0 = Clock::now();
@@ -313,6 +355,7 @@ ExchangeResult run_exchange(Backend& backend, unsigned threads, unsigned remote_
             }
             const Clock::time_point a1 = Clock::now();
             barrier.arrive_and_wait();
+            std::uint64_t sum = 0;
             const Clock::time_point f0 = Clock::now();
             for (const auto& [producer, index] : frees[t]) {
                 void* ptr = slots[producer][index];
@@ -320,13 +363,23 @@ ExchangeResult run_exchange(Backend& backend, unsigned threads, unsigned remote_
                 backend.deallocate(ptr);
             }
             const Clock::time_point f1 = Clock::now();
+            // Every deallocation of the round has been issued once all
+            // threads are here; reclaim what was freed on our behalf.
+            barrier.arrive_and_wait();
+            const Clock::time_point d0 = Clock::now();
+            backend.drain();
+            const Clock::time_point d1 = Clock::now();
             alloc_ns[round][t] = elapsed_ns(a0, a1);
             free_ns[round][t] = elapsed_ns(f0, f1);
+            drain_ns[round][t] = elapsed_ns(d0, d1);
+            if (sum != expected[t]) {
+                g_checksum_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            total += sum;
         }
         // All cross-thread deallocations are complete once everyone is here.
         barrier.arrive_and_wait();
-        backend.drain();
-        g_checksum.fetch_add(sum, std::memory_order_relaxed);
+        g_checksum.fetch_add(total, std::memory_order_relaxed);
     };
 
     std::vector<std::thread> pool;
@@ -337,34 +390,30 @@ ExchangeResult run_exchange(Backend& backend, unsigned threads, unsigned remote_
         thread.join();
     }
 
-    const double ops_per_phase = static_cast<double>(objects) * threads;
-    std::vector<double> alloc_rates;
-    std::vector<double> free_rates;
-    std::vector<double> combined_rates;
+    const double ops = static_cast<double>(objects) * threads;
     for (unsigned round = options.warmup; round < total_rounds; ++round) {
-        const double alloc_time = *std::max_element(alloc_ns[round].begin(), alloc_ns[round].end());
-        const double free_time = *std::max_element(free_ns[round].begin(), free_ns[round].end());
-        alloc_rates.push_back(ops_per_phase / alloc_time * 1e3);
-        free_rates.push_back(ops_per_phase / free_time * 1e3);
-        combined_rates.push_back(2 * ops_per_phase / (alloc_time + free_time) * 1e3);
+        const double alloc_time = max_of(alloc_ns[round]);
+        const double free_time = max_of(free_ns[round]);
+        const double drain_time = max_of(drain_ns[round]);
+        out.alloc.push_back(rate(ops, alloc_time));
+        out.free.push_back(rate(ops, free_time));
+        out.done.push_back(rate(ops, free_time + drain_time));
+        out.combined.push_back(rate(2 * ops, alloc_time + free_time + drain_time));
     }
-    ExchangeResult result;
-    result.alloc_mops = median(alloc_rates);
-    result.free_mops = median(free_rates);
-    result.combined_mops = median(combined_rates);
-    result.reserved = backend.reserved_bytes();
-    return result;
+    out.reserved = backend.reserved_bytes();
 }
 
 // ---- many-to-one scenario ------------------------------------------------------
 
-struct ManyToOneResult {
-    double owner_alloc_mops = 0;
-    double remote_free_mops = 0;
-    double drain_mops = 0;
+struct ManyToOneRounds {
+    std::vector<double> owner_alloc;  // Mops/s
+    std::vector<double> free;         // remote deallocate() calls, Mops/s
+    std::vector<double> drain;        // blocks drained by the owner, M/s
+    std::vector<double> done;         // remote frees including the drain, Mops/s
 };
 
-ManyToOneResult run_many_to_one(Backend& backend, unsigned threads, const Options& options) {
+void run_many_to_one(Backend& backend, unsigned threads, const Options& options,
+                     ManyToOneRounds& out) {
     const unsigned freers = threads - 1;
     const std::size_t per_freer = options.objects;
     const std::size_t total = per_freer * freers;
@@ -381,7 +430,11 @@ ManyToOneResult run_many_to_one(Backend& backend, unsigned threads, const Option
     SpinBarrier barrier(threads);
 
     auto worker = [&](unsigned t) {
-        std::uint64_t sum = 0;
+        std::uint64_t checked = 0;
+        // Freer t reads the stamps of indices [begin, begin + per_freer).
+        const std::size_t begin = t == 0 ? 0 : (t - 1) * per_freer;
+        const std::uint64_t expected =
+            t == 0 ? 0 : per_freer * begin + per_freer * (per_freer - 1) / 2;
         for (unsigned round = 0; round < total_rounds; ++round) {
             barrier.arrive_and_wait();
             if (t == 0) {
@@ -395,13 +448,17 @@ ManyToOneResult run_many_to_one(Backend& backend, unsigned threads, const Option
             }
             barrier.arrive_and_wait();
             if (t != 0) {
+                std::uint64_t sum = 0;
                 const Clock::time_point start = Clock::now();
-                const std::size_t begin = (t - 1) * per_freer;
                 for (std::size_t i = begin; i < begin + per_freer; ++i) {
                     sum += read_stamp(slots[i]);
                     backend.deallocate(slots[i]);
                 }
                 free_ns[round][t] = elapsed_ns(start, Clock::now());
+                if (sum != expected) {
+                    g_checksum_errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                checked += sum;
             }
             barrier.arrive_and_wait();
             if (t == 0) {
@@ -411,7 +468,7 @@ ManyToOneResult run_many_to_one(Backend& backend, unsigned threads, const Option
             }
         }
         barrier.arrive_and_wait();
-        g_checksum.fetch_add(sum, std::memory_order_relaxed);
+        g_checksum.fetch_add(checked, std::memory_order_relaxed);
     };
 
     std::vector<std::thread> pool;
@@ -422,16 +479,26 @@ ManyToOneResult run_many_to_one(Backend& backend, unsigned threads, const Option
         thread.join();
     }
 
-    std::vector<double> owner_rates;
-    std::vector<double> free_rates;
-    std::vector<double> drain_rates;
+    const auto blocks = static_cast<double>(total);
     for (unsigned round = options.warmup; round < total_rounds; ++round) {
-        owner_rates.push_back(static_cast<double>(total) / owner_ns[round] * 1e3);
-        const double free_time = *std::max_element(free_ns[round].begin(), free_ns[round].end());
-        free_rates.push_back(static_cast<double>(total) / free_time * 1e3);
-        drain_rates.push_back(static_cast<double>(total) / std::max(drain_ns[round], 1.0) * 1e3);
+        const double free_time = max_of(free_ns[round]);
+        out.owner_alloc.push_back(rate(blocks, owner_ns[round]));
+        out.free.push_back(rate(blocks, free_time));
+        out.drain.push_back(rate(blocks, std::max(drain_ns[round], 1.0)));
+        out.done.push_back(rate(blocks, free_time + drain_ns[round]));
     }
-    return {median(owner_rates), median(free_rates), median(drain_rates)};
+}
+
+/// Runs `body(index)` `repeats` times for every allocator, rotating which
+/// allocator goes first.
+template <class Body>
+void rotate_allocators(const Options& options, unsigned configuration, Body&& body) {
+    const std::size_t n = options.allocators.size();
+    for (unsigned repeat = 0; repeat < options.repeats; ++repeat) {
+        for (std::size_t k = 0; k < n; ++k) {
+            body((k + repeat + configuration) % n);
+        }
+    }
 }
 
 int run(const Options& options) {
@@ -446,58 +513,90 @@ int run(const Options& options) {
     std::printf("  platform   %s\n", platform.os.c_str());
     std::printf("  cpu        %s (%u logical CPUs)\n", platform.cpu.c_str(), platform.logical_cpus);
     std::printf("  system     %s\n", platform.system_allocator.c_str());
-    std::printf("  method     %zu objects of 16-511 B per thread per round, %u warmup + %u "
-                "measured rounds, medians\n\n",
-                options.objects, options.warmup, options.rounds);
+    std::printf("  method     %zu objects of 16-511 B per thread per round; %u run(s) per "
+                "allocator in rotating order, each %u warmup + %u measured rounds; medians over "
+                "all measured rounds\n\n",
+                options.objects, options.repeats, options.warmup, options.rounds);
 
-    std::printf("Exchange: allocate N per thread, then deallocate; remote%% are freed by "
-                "another thread\n");
-    std::printf("%7s %7s %-10s %12s %12s %12s %12s\n", "threads", "remote", "allocator",
-                "alloc Mops/s", "free Mops/s", "comb Mops/s", "reserved MiB");
+    std::printf("Exchange: allocate N per thread, free them (remote%% by another thread), "
+                "drain\n");
+    std::printf("%7s %7s %-10s %9s %9s %9s %9s %7s %9s\n", "threads", "remote", "allocator",
+                "alloc", "free", "done", "combined", "noise", "reserved");
+    std::printf("%7s %7s %-10s %9s %9s %9s %9s %7s %9s\n", "", "", "", "Mops/s", "Mops/s",
+                "Mops/s", "Mops/s", "%", "MiB");
+    unsigned configuration = 0;
     for (unsigned threads : options.threads) {
         for (unsigned percent : options.remote_percent) {
             if (threads == 1 && percent != 0) {
                 continue;
             }
-            for (const std::string& name : options.allocators) {
-                std::unique_ptr<Backend> backend = make_backend(name, threads, options.objects);
-                const ExchangeResult r = run_exchange(*backend, threads, percent, options);
+            std::vector<ExchangeRounds> rounds(options.allocators.size());
+            rotate_allocators(options, configuration++, [&](std::size_t index) {
+                std::unique_ptr<Backend> backend =
+                    make_backend(options.allocators[index], threads, options.objects);
+                run_exchange(*backend, threads, percent, options, rounds[index]);
+            });
+            for (std::size_t index = 0; index < options.allocators.size(); ++index) {
+                const std::string& name = options.allocators[index];
+                const ExchangeRounds& r = rounds[index];
                 char reserved[32] = "n/a";
                 if (name == "nanoalloc") {
                     std::snprintf(reserved, sizeof(reserved), "%.1f",
                                   static_cast<double>(r.reserved) / (1024.0 * 1024.0));
                 }
-                std::printf("%7u %6u%% %-10s %12.2f %12.2f %12.2f %12s\n", threads, percent,
-                            name.c_str(), r.alloc_mops, r.free_mops, r.combined_mops, reserved);
-                std::fflush(stdout);
+                std::printf("%7u %6u%% %-10s %9.2f %9.2f %9.2f %9.2f %7.1f %9s\n", threads,
+                            percent, name.c_str(), median(r.alloc), median(r.free),
+                            median(r.done), median(r.combined), noise_percent(r.combined),
+                            reserved);
             }
+            std::fflush(stdout);
         }
     }
 
     if (options.many_to_one) {
         std::printf("\nMany-to-one: thread 0 allocates, all other threads free into its inbox, "
                     "thread 0 drains\n");
-        std::printf("%7s %-10s %15s %15s %15s\n", "threads", "allocator", "owner alloc",
-                    "remote free", "drain");
-        std::printf("%7s %-10s %15s %15s %15s\n", "", "", "Mops/s", "Mops/s", "Mblocks/s");
+        std::printf("%7s %-10s %11s %11s %11s %11s %7s\n", "threads", "allocator",
+                    "owner alloc", "free", "drain", "done", "noise");
+        std::printf("%7s %-10s %11s %11s %11s %11s %7s\n", "", "", "Mops/s", "Mops/s",
+                    "Mblocks/s", "Mops/s", "%");
         for (unsigned threads : options.threads) {
             if (threads < 2) {
                 continue;
             }
-            for (const std::string& name : options.allocators) {
-                std::unique_ptr<Backend> backend = make_backend(name, threads, options.objects);
-                const ManyToOneResult r = run_many_to_one(*backend, threads, options);
+            std::vector<ManyToOneRounds> rounds(options.allocators.size());
+            rotate_allocators(options, configuration++, [&](std::size_t index) {
+                std::unique_ptr<Backend> backend =
+                    make_backend(options.allocators[index], threads, options.objects);
+                run_many_to_one(*backend, threads, options, rounds[index]);
+            });
+            for (std::size_t index = 0; index < options.allocators.size(); ++index) {
+                const std::string& name = options.allocators[index];
+                const ManyToOneRounds& r = rounds[index];
                 char drain[32] = "n/a";
                 if (name == "nanoalloc") {
-                    std::snprintf(drain, sizeof(drain), "%.2f", r.drain_mops);
+                    std::snprintf(drain, sizeof(drain), "%.2f", median(r.drain));
                 }
-                std::printf("%7u %-10s %15.2f %15.2f %15s\n", threads, name.c_str(),
-                            r.owner_alloc_mops, r.remote_free_mops, drain);
-                std::fflush(stdout);
+                std::printf("%7u %-10s %11.2f %11.2f %11s %11.2f %7.1f\n", threads, name.c_str(),
+                            median(r.owner_alloc), median(r.free), drain, median(r.done),
+                            noise_percent(r.done));
             }
+            std::fflush(stdout);
         }
     }
-    std::printf("\nchecksum 0x%" PRIx64 "\n", g_checksum.load());
+    std::printf("\nDefinitions\n"
+                "  free      deallocate() calls only (a remote free hands the block to its owner)\n"
+                "  done      deallocate() calls plus the drain phase: every block reusable again\n"
+                "  combined  allocations and deallocations / (allocation + free + drain time)\n"
+                "  noise     median absolute deviation over measured rounds, relative to the "
+                "median\n"
+                "  reserved  nanoalloc PoolStats::reserved_bytes after the last run\n");
+    if (g_checksum_errors.load() != 0) {
+        std::fprintf(stderr, "error: %" PRIu64 " checksum mismatches (blocks were overwritten or "
+                     "handed out twice)\n", g_checksum_errors.load());
+        return 1;
+    }
+    std::printf("\nchecksum 0x%" PRIx64 " (validated for every round)\n", g_checksum.load());
     return 0;
 }
 

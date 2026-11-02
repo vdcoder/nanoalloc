@@ -11,22 +11,33 @@
 //   trace through the same code path; only the allocate/deallocate calls
 //   differ. The benchmark uses only the public Pool API.
 // * Each allocation writes a stamp into its first 8 bytes and its last byte;
-//   each deallocation reads them back into a checksum that is printed at the
-//   end. The workload therefore touches real memory and cannot be optimized
-//   away.
+//   each deallocation reads them back into a checksum. The expected checksum
+//   is computed from the trace, and every replay (warmup and measured) must
+//   reproduce it exactly, otherwise the benchmark stops with an error. The
+//   workload therefore touches real memory, cannot be optimized away, and a
+//   replay that returned overlapping or corrupted blocks is detected.
 // * Traces are grouped into segments of only allocations or only
 //   deallocations. Each segment is timed with one steady_clock read at its
 //   boundary, so allocation and deallocation throughput can be reported
 //   separately without per-operation timer overhead.
 // * Each (workload, allocator) pair runs `warmup` unmeasured iterations and
-//   `iterations` measured ones; medians are reported. The order of the
-//   allocators alternates between iterations to cancel drift.
+//   `iterations` measured ones; medians are reported with their spread (median
+//   absolute deviation, minimum and maximum). The allocator order rotates
+//   between iterations (iteration i starts with allocator i mod n), so every
+//   allocator runs in every position equally often when the iteration count
+//   is a multiple of the number of allocators.
+// * All allocators replay the same trace with the same configuration: one
+//   arena size per workload for every nanoalloc variant.
 // * A separate, untimed replay measures memory: peak usable and consumed
 //   bytes, payload slack and metadata.
 // * The nanoalloc arena is sized from the trace (at least twice its peak live
 //   requested bytes, doubled until the untimed replay succeeds), so a too
 //   small arena can never make nanoalloc fail where the system allocator
 //   succeeds. Any allocation failure during a timed run aborts the benchmark.
+// * Only the public Pool API is used, and statistics fields that older
+//   library versions lack are detected at compile time, so this harness can
+//   be built unchanged against earlier nanoalloc releases for before/after
+//   comparisons on identical traces.
 #include <nanoalloc/pool.hpp>
 #include <nanoalloc/version.hpp>
 
@@ -62,7 +73,7 @@ constexpr double kMiB = 1024.0 * 1024.0;
 
 struct Options {
     unsigned iterations = 9;
-    unsigned warmup = 1;
+    unsigned warmup = 2;
     double scale = 1.0;
     std::uint64_t seed = 0x6E616E6FULL;
     std::vector<std::string> workloads;  // empty: all
@@ -87,7 +98,7 @@ void print_usage() {
     std::printf(
         "usage: nanoalloc_bench [options]\n"
         "  --iterations N     measured iterations per workload, 1-100000 (default 9)\n"
-        "  --warmup N         unmeasured warmup iterations, 0-100000 (default 1)\n"
+        "  --warmup N         unmeasured warmup iterations, 0-100000 (default 2)\n"
         "  --scale F          multiply operation counts by F, 0 < F <= 1000 (default 1.0)\n"
         "  --quick            shorthand for --scale 0.1 --iterations 3\n"
         "  --seed N           trace seed (default 0x6E616E6F)\n"
@@ -176,6 +187,19 @@ Options parse_options(int argc, char** argv) {
 }
 
 // ---------------------------------------------------------------------------
+// Statistics fields that not every library version has
+// ---------------------------------------------------------------------------
+
+template <class Stats>
+std::uint64_t reserved_of(const Stats& stats) {
+    if constexpr (requires { stats.reserved_bytes; }) {
+        return stats.reserved_bytes;
+    } else {
+        return stats.capacity_bytes;  // the whole arena is the reservation
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Memory access and optimization barriers
 // ---------------------------------------------------------------------------
 
@@ -210,6 +234,29 @@ inline std::uint64_t consume(const void* ptr, std::uint32_t size) {
         std::memcpy(&stamp, bytes, sizeof(stamp));
     }
     return size > 0 ? stamp + bytes[size - 1] : stamp;
+}
+
+/// The value consume() returns for a block that touch() stamped.
+std::uint64_t expected_consume(std::uint32_t size, std::uint32_t slot) {
+    if (size > 8) {  // the stamp and the last byte do not overlap
+        return ((std::uint64_t{slot} << 32) | size) + (slot & 0xFFU);
+    }
+    unsigned char buffer[8] = {};  // overlapping cases, in native byte order
+    touch(buffer, size, slot);
+    return consume(buffer, size);
+}
+
+/// Checksum that a correct replay of `trace` produces.
+std::uint64_t expected_checksum(const Trace& trace) {
+    std::uint64_t sum = 0;
+    for (const Segment& segment : trace.segments) {
+        if (segment.phase == Phase::Deallocate) {
+            for (std::uint32_t i = segment.begin; i < segment.end; ++i) {
+                sum += expected_consume(trace.ops[i].size, trace.ops[i].slot);
+            }
+        }
+    }
+    return sum;
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +298,7 @@ struct Sample {
 template <class Backend>
 Sample replay_timed(const Trace& trace, Backend& backend, std::vector<void*>& slots,
                     std::uint64_t& checksum) {
+    // `checksum` receives this replay's checksum; the caller validates it.
     Sample sample;
     const Op* ops = trace.ops.data();
     void** slot_ptrs = slots.data();
@@ -280,7 +328,7 @@ Sample replay_timed(const Trace& trace, Backend& backend, std::vector<void*>& sl
         last = now;
     }
     sample.total_ns = std::chrono::duration<double, std::nano>(last - start).count();
-    checksum += sum;
+    checksum = sum;
     return sample;
 }
 
@@ -375,7 +423,7 @@ bool measure_pool(const Trace& trace, const nanoalloc::PoolConfig& config, Memor
     result.peak_usable = stats.peak_usable_bytes;
     result.peak_consumed = stats.peak_consumed_bytes;
     result.capacity = stats.capacity_bytes;
-    result.reserved = stats.reserved_bytes;
+    result.reserved = reserved_of(stats);
     result.metadata = stats.metadata_bytes;
     result.tracking = stats.tracking_bytes;
     result.splits = stats.split_count;
@@ -438,6 +486,8 @@ struct Result {
     double median_free_ns = 0;
     double median_total_ns = 0;
     double noise = 0;  // median absolute deviation / median of total time
+    double min_combined_mops = 0;  // slowest and fastest measured iteration
+    double max_combined_mops = 0;
 };
 
 double median(std::vector<double> values) {
@@ -449,14 +499,25 @@ double median(std::vector<double> values) {
     return n % 2 == 1 ? values[n / 2] : 0.5 * (values[n / 2 - 1] + values[n / 2]);
 }
 
+double mops(std::uint64_t operations, double ns) {
+    return ns > 0 ? static_cast<double>(operations) / ns * 1e3 : 0.0;
+}
+
 void summarize(Result& result) {
     std::vector<double> alloc;
     std::vector<double> free;
     std::vector<double> total;
+    std::vector<double> combined;
     for (const Sample& sample : result.samples) {
         alloc.push_back(sample.alloc_ns);
         free.push_back(sample.free_ns);
         total.push_back(sample.total_ns);
+        combined.push_back(
+            mops(result.allocations + result.deallocations, sample.alloc_ns + sample.free_ns));
+    }
+    if (!combined.empty()) {
+        result.min_combined_mops = *std::min_element(combined.begin(), combined.end());
+        result.max_combined_mops = *std::max_element(combined.begin(), combined.end());
     }
     result.median_alloc_ns = median(alloc);
     result.median_free_ns = median(free);
@@ -467,10 +528,6 @@ void summarize(Result& result) {
                                                             : result.median_total_ns - value);
     }
     result.noise = result.median_total_ns > 0 ? median(deviations) / result.median_total_ns : 0;
-}
-
-double mops(std::uint64_t operations, double ns) {
-    return ns > 0 ? static_cast<double>(operations) / ns * 1e3 : 0.0;
 }
 
 /// Picks an arena large enough for the trace: at least twice the peak live
@@ -522,22 +579,25 @@ void print_header(const Options& options, const PlatformInfo& platform) {
 
 void print_runtime_table(const std::vector<Result>& results) {
     std::printf("Runtime (median of measured iterations)\n");
-    std::printf("%-14s %-17s %10s %10s %10s %9s %9s %10s %8s\n", "workload", "allocator",
-                "alloc", "free", "combined", "alloc", "free", "total", "noise");
-    std::printf("%-14s %-17s %10s %10s %10s %9s %9s %10s %8s\n", "", "", "Mops/s", "Mops/s",
-                "Mops/s", "ns/op", "ns/op", "ms", "%");
+    std::printf("%-14s %-17s %10s %10s %10s %9s %9s %10s %8s %15s\n", "workload", "allocator",
+                "alloc", "free", "combined", "alloc", "free", "total", "noise", "combined");
+    std::printf("%-14s %-17s %10s %10s %10s %9s %9s %10s %8s %15s\n", "", "", "Mops/s", "Mops/s",
+                "Mops/s", "ns/op", "ns/op", "ms", "%", "min-max Mops/s");
     std::string previous;
     for (const Result& r : results) {
         const bool first = r.workload != previous;
         previous = r.workload;
         const double timed = r.median_alloc_ns + r.median_free_ns;
-        std::printf("%-14s %-17s %10.2f %10.2f %10.2f %9.2f %9.2f %10.2f %8.1f\n",
+        char range[32];
+        std::snprintf(range, sizeof(range), "%.1f-%.1f", r.min_combined_mops,
+                      r.max_combined_mops);
+        std::printf("%-14s %-17s %10.2f %10.2f %10.2f %9.2f %9.2f %10.2f %8.1f %15s\n",
                     first ? r.workload.c_str() : "", r.allocator.c_str(),
                     mops(r.allocations, r.median_alloc_ns), mops(r.deallocations, r.median_free_ns),
                     mops(r.allocations + r.deallocations, timed),
                     r.median_alloc_ns / static_cast<double>(r.allocations),
                     r.median_free_ns / static_cast<double>(r.deallocations),
-                    r.median_total_ns / 1e6, r.noise * 100.0);
+                    r.median_total_ns / 1e6, r.noise * 100.0, range);
     }
     std::printf("\n");
 }
@@ -606,6 +666,7 @@ void print_definitions() {
         "  total ms           wall time of one full trace replay, including timer reads\n"
         "  noise              median absolute deviation of the total time across measured\n"
         "                     iterations, relative to the median\n"
+        "  min-max            slowest and fastest measured iteration (combined Mops/s)\n"
         "  peak req           max over time of live requested bytes (from the trace)\n"
         "  peak use           max over time of live usable bytes (usable_size / malloc_usable_size)\n"
         "  peak con           max over time of arena bytes consumed by live allocations,\n"
@@ -614,13 +675,13 @@ void print_definitions() {
         "  slack              usable - requested, averaged over all allocations (B/alloc) and\n"
         "                     relative to all requested bytes (%%); max = worst single allocation\n"
         "  arena / util       nanoalloc arena capacity / peak consumed as a share of it\n"
-        "  reserved           nanoalloc memory reserved from its arena (and the system, for\n"
-        "                     oversized blocks) at the end of the replay\n"
-        "  metadata           nanoalloc bookkeeping outside the arena (engine metadata plus the\n"
-        "                     requested-size table when tracking is enabled), and its share of\n"
-        "                     the arena\n"
-        "  nanoalloc          default PoolConfig (no requested-size tracking)\n"
-        "  nanoalloc-tracked  PoolConfig::track_requested_bytes = true\n\n");
+        "  reserved           PoolStats::reserved_bytes at the end of the replay: the budget\n"
+        "                     charged (versions without that field: the whole arena)\n"
+        "  metadata           PoolStats::metadata_bytes + tracking_bytes (bookkeeping), and\n"
+        "                     its share of the arena\n"
+        "  nanoalloc          PoolConfig::track_requested_bytes = false\n"
+        "  nanoalloc-tracked  PoolConfig::track_requested_bytes = true\n"
+        "  checksum           every replay reproduced the checksum computed from the trace\n\n");
 }
 
 void write_csv(const std::string& path, const std::vector<Result>& results,
@@ -632,7 +693,8 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
     out << "workload,allocator,allocations,deallocations,alloc_ns_median,free_ns_median,"
            "total_ns_median,alloc_mops,free_mops,combined_mops,noise,peak_requested,"
            "peak_usable,peak_consumed,total_requested,total_usable,max_slack,capacity,"
-           "metadata,tracking,splits,merges,reserved,compiler,build_type,cpu\n";
+           "metadata,tracking,splits,merges,reserved,combined_mops_min,combined_mops_max,"
+           "samples,library_version,compiler,build_type,cpu\n";
     for (const Result& r : results) {
         const MemoryResult& m = r.memory;
         out << r.workload << ',' << r.allocator << ',' << r.allocations << ',' << r.deallocations
@@ -651,8 +713,10 @@ void write_csv(const std::string& path, const std::vector<Result>& results,
             << (m.arena_known ? std::to_string(m.tracking) : "") << ','
             << (m.arena_known ? std::to_string(m.splits) : "") << ','
             << (m.arena_known ? std::to_string(m.merges) : "") << ','
-            << (m.arena_known ? std::to_string(m.reserved) : "") << ",\"" << platform.compiler
-            << "\"," << platform.build_type << ",\"" << platform.cpu << "\"\n";
+            << (m.arena_known ? std::to_string(m.reserved) : "") << ',' << r.min_combined_mops
+            << ',' << r.max_combined_mops << ',' << r.samples.size() << ','
+            << nanoalloc::version_string << ",\"" << platform.compiler << "\","
+            << platform.build_type << ",\"" << platform.cpu << "\"\n";
     }
 }
 
@@ -661,7 +725,7 @@ int run(const Options& options) {
     print_header(options, platform);
 
     std::vector<Result> results;
-    std::uint64_t checksum = 0;
+    std::uint64_t checksum = 0;  // sum of the validated per-trace checksums
 
     std::printf("Workloads\n");
     for (const std::string& name : options.workloads) {
@@ -702,17 +766,26 @@ int run(const Options& options) {
         }
 
         std::vector<void*> slots(trace.slot_count, nullptr);
+        const std::uint64_t expected = expected_checksum(trace);
         const unsigned total_iterations = options.warmup + options.iterations;
         for (unsigned iteration = 0; iteration < total_iterations; ++iteration) {
             for (std::size_t k = 0; k < runners.size(); ++k) {
-                // Alternate the allocator order between iterations.
-                const std::size_t index = iteration % 2 == 0 ? k : runners.size() - 1 - k;
-                const Sample sample = runners[index]->run(trace, slots, checksum);
+                // Rotate the allocator order: each allocator runs in each
+                // position equally often.
+                const std::size_t index = (k + iteration) % runners.size();
+                std::uint64_t replay_checksum = 0;
+                const Sample sample = runners[index]->run(trace, slots, replay_checksum);
+                if (replay_checksum != expected) {
+                    throw std::runtime_error("checksum mismatch replaying " + trace.name +
+                                             " with " + runners[index]->name() +
+                                             ": blocks were overwritten or overlapped");
+                }
                 if (iteration >= options.warmup) {
                     trace_results[index].samples.push_back(sample);
                 }
             }
         }
+        checksum += expected;
         for (Result& result : trace_results) {
             summarize(result);
             if (options.verbose) {
@@ -731,7 +804,7 @@ int run(const Options& options) {
     print_runtime_table(results);
     print_memory_table(results);
     print_definitions();
-    std::printf("checksum 0x%" PRIx64 "\n", checksum);
+    std::printf("checksum 0x%" PRIx64 " (validated for every replay)\n", checksum);
 
     if (!options.csv_path.empty()) {
         write_csv(options.csv_path, results, platform);
