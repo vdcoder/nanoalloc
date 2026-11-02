@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -44,7 +45,9 @@ public:
                                                    static_cast<std::size_t>(high_bits)));
         const std::size_t range_low = std::max(low, std::size_t{1} << (bits - 1));
         const std::size_t range_high =
-            std::min(high, bits >= 63 ? high : (std::size_t{1} << bits) - 1);
+            std::min(high, bits >= std::numeric_limits<std::size_t>::digits
+                               ? high
+                               : (std::size_t{1} << bits) - 1);
         return range_low >= range_high ? range_low : between(range_low, range_high);
     }
 

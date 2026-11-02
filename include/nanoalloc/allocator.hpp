@@ -54,7 +54,9 @@ public:
         static_assert(alignof(T) <= Pool::max_alignment,
                       "nanoalloc::Allocator: alignof(T) exceeds "
                       "Pool::max_alignment");
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+        // Parenthesized so that a function-like max macro (e.g. from
+        // <windows.h> without NOMINMAX) cannot interfere.
+        if (n > (std::numeric_limits<std::size_t>::max)() / sizeof(T)) {
             throw std::bad_array_new_length();
         }
         constexpr std::size_t alignment = alignof(T) > Pool::min_alignment

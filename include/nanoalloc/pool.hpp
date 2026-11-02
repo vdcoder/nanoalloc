@@ -122,9 +122,10 @@ struct PoolStats {
 ///     fully restored (free_bytes == capacity_bytes, and largest_free_block
 ///     returns to its initial value).
 ///
-/// Thread safety: a Pool is NOT thread-safe. Concurrent calls on the same Pool
-/// (including const member functions concurrently with mutating ones) are
-/// data races. Distinct Pool objects may be used from different threads.
+/// Thread safety: a Pool is NOT thread-safe. Every call on the same Pool,
+/// including const member functions, must be externally synchronized; there
+/// is no exception for concurrent const calls. Distinct Pool objects may be
+/// used from different threads.
 ///
 /// Lifetime: the Pool must outlive every allocation made from it and every
 /// adapter (MemoryResource, Allocator) and container that refers to it.

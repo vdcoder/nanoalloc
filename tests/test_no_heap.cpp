@@ -110,7 +110,10 @@ std::size_t churn(nanoalloc::Pool& pool, std::vector<void*>& live) {
 
 NANO_TEST(replacement_operator_new_is_active) {
     const std::size_t before = g_new_calls.load();
-    delete new int(1);
+    // A direct call (unlike a new-expression) may not be optimized away; the
+    // volatile pointer keeps the result observable.
+    void* volatile probe = ::operator new(16);
+    ::operator delete(probe);
     CHECK_EQ(g_new_calls.load() - before, 1U);
 }
 

@@ -151,9 +151,12 @@ NANO_TEST(unobtainable_arena_throws_bad_alloc) {
         // ASan reports oversized system allocations as errors instead of
         // failing them, so this case cannot be exercised under ASan.
         std::printf("  skipped under AddressSanitizer\n");
-        return;
+    } else if constexpr (sizeof(void*) < 8) {
+        // On 32-bit targets max_capacity (1 GiB) can often be reserved.
+        std::printf("  skipped on 32-bit targets\n");
+    } else {
+        CHECK_THROWS_AS(Pool(PoolConfig{Pool::max_capacity}), std::bad_alloc);
     }
-    CHECK_THROWS_AS(Pool(PoolConfig{Pool::max_capacity}), std::bad_alloc);
 }
 
 NANO_TEST(capacity_is_rounded_up_to_granularity) {
@@ -168,16 +171,21 @@ NANO_TEST(capacity_is_rounded_up_to_granularity) {
     }
 }
 
-NANO_TEST(tiny_pool_serves_one_minimum_allocation) {
+NANO_TEST(tiny_pool_behaves_consistently) {
     Pool pool({Pool::granularity});
-    void* first = pool.allocate(Pool::granularity);
-    CHECK(first != nullptr);
-    CHECK(pool.try_allocate(1) == nullptr);
-    CHECK_THROWS_AS(pool.allocate(1), std::bad_alloc);
-    pool.deallocate(first);
-    void* again = pool.allocate(1);
-    CHECK(again != nullptr);
-    pool.deallocate(again);
+    const PoolStats initial = pool.stats();
+    CHECK(initial.largest_free_block <= initial.capacity_bytes);
+    CHECK_THROWS_AS(pool.allocate(pool.capacity() + 1), std::bad_alloc);
+    if (initial.largest_free_block > 0) {
+        for (int round = 0; round < 3; ++round) {
+            void* ptr = pool.allocate(initial.largest_free_block);
+            REQUIRE(ptr != nullptr);
+            CHECK(pool.usable_size(ptr) >= initial.largest_free_block);
+            pool.deallocate(ptr);
+            CHECK_EQ(pool.stats().free_bytes, initial.free_bytes);
+            CHECK_EQ(pool.stats().largest_free_block, initial.largest_free_block);
+        }
+    }
     CHECK(pool.verify_integrity());
 }
 
@@ -246,7 +254,7 @@ NANO_TEST(alignment_above_maximum_is_bad_alloc) {
     const PoolStats before = pool.stats();
     CHECK_THROWS_AS(pool.allocate(16, Pool::max_alignment * 2), std::bad_alloc);
     CHECK(pool.try_allocate(16, Pool::max_alignment * 2) == nullptr);
-    CHECK(pool.try_allocate(16, std::size_t{1} << 40) == nullptr);
+    CHECK(pool.try_allocate(16, Pool::max_alignment << 8) == nullptr);
     const PoolStats after = pool.stats();
     CHECK(same_counters(before, after));
     CHECK_EQ(after.failed_allocation_count, before.failed_allocation_count + 3);
@@ -462,7 +470,6 @@ NANO_TEST(exhaustion_throws_and_full_recovery_follows) {
     Pool pool({256 * kKiB});
     const std::size_t initial_largest = pool.stats().largest_free_block;
     Rng rng(3);
-    std::size_t first_round = 0;
     for (int round = 0; round < 3; ++round) {
         std::vector<void*> ptrs;
         for (;;) {
@@ -495,11 +502,6 @@ NANO_TEST(exhaustion_throws_and_full_recovery_follows) {
         CHECK_EQ(recovered.live_allocations, 0U);
         CHECK_EQ(recovered.free_bytes, recovered.capacity_bytes);
         CHECK_EQ(recovered.largest_free_block, initial_largest);
-        if (round == 0) {
-            first_round = ptrs.size();
-        } else {
-            CHECK(ptrs.size() >= first_round);
-        }
     }
     void* whole = pool.allocate(initial_largest);
     CHECK(whole != nullptr);

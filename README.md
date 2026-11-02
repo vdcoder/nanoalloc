@@ -226,8 +226,9 @@ executed by the test suite.
   does not run destructors of objects still living in it.
 - A `Pool` is not copyable or movable (adapters hold its address). Use
   `std::unique_ptr<nanoalloc::Pool>` for a movable handle.
-- **A `Pool` is not thread-safe.** Concurrent calls on the same pool, including
-  `stats()` concurrently with allocation, are data races. Separate pools may be
+- **A `Pool` is not thread-safe.** Every call on the same pool, including
+  const ones such as `stats()` and `usable_size()`, must be externally
+  synchronized; concurrent calls are data races. Separate pools may be
   used from separate threads. The engine deliberately has no locks; concurrent
   support will be added when there is a measured need for it.
 
@@ -455,7 +456,7 @@ other allocators.
 
 | Group | Label | Contents |
 | --- | --- | --- |
-| Public contract | `contract` | `test_pool`, `test_stress`, `test_pmr`, `test_allocator`: alignment (1-4096), boundary sizes (15/16/17, 31/32/33, ... up to 64 KiB + 1), zero-byte and null cases, read/write of the whole usable range, non-overlap, content integrity under unrelated activity, exhaustion and full recovery, large and mixed objects, statistics against an independent model, pmr and Allocator integration with standard containers and non-trivial element types |
+| Public contract | `contract` | `test_pool`, `test_stress`, `test_pmr`, `test_allocator`, `test_no_heap`: alignment (1-4096), boundary sizes (15/16/17, 31/32/33, ... up to 64 KiB + 1), zero-byte and null cases, read/write of the whole usable range, non-overlap, content integrity under unrelated activity, exhaustion and full recovery, large and mixed objects, statistics against an independent model, pmr and Allocator integration with standard containers and non-trivial element types, and a check (via counting replacements of global `operator new`) that no Pool operation allocates after construction |
 | Stress | `stress` | Deterministic randomized runs with reproducible seeds (8 scenarios x 4 seeds). Every live allocation is pattern-filled across its usable range and verified throughout the run, not only at the end, together with non-overlap, statistics and `verify_integrity()`. Set `NANOALLOC_STRESS_SEED` and `NANOALLOC_STRESS_SCALE` to reproduce or extend a run |
 | Engine | `engine` | `test_buddy`: power-of-two rounding, recursive splitting, buddy identification, merging of valid pairs only, multilevel coalescing, recovery of the original block, free-list and bitmap consistency, non-power-of-two arenas, metadata size |
 | Misuse | `misuse` | Double free, foreign, interior and misaligned pointers must end in nanoalloc's diagnostic; with ASan, use-after-free and overflow into a free block must be reported by ASan |
